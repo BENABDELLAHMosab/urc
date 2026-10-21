@@ -37,7 +37,7 @@ export default async function handler(request) {
             });
         }
     } catch (error) {
-        console.log(error);
+        console.error("Login request failed");
         return new Response(JSON.stringify(error), {
             status: 500,
             headers: {'content-type': 'application/json'},
