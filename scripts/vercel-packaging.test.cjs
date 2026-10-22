@@ -10,11 +10,11 @@ const {FileFsRef, FileBlob} = require('@vercel/build-utils');
 
 const root = path.resolve(__dirname, '..');
 
-test('Vercel packages login and register with the PostgreSQL Node entrypoint', async t => {
+test('Vercel packages authentication and messages with the PostgreSQL Node entrypoint', async t => {
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'urc-packaging-'));
     const source = path.join(temporary, 'source');
     try {
-        const entries = ['api/login.js', 'api/register.js'];
+        const entries = ['api/login.js', 'api/register.js', 'api/message.js'];
         const {fileList} = await nodeFileTrace(entries, {
             base: root, mixedModules: true, moduleSyncCatchall: true,
         });
@@ -35,7 +35,7 @@ test('Vercel packages login and register with the PostgreSQL Node entrypoint', a
         const config = JSON.parse(await fs.readFile(path.join(root, 'vercel.json'), 'utf8'));
 
         for (const entrypoint of entries) {
-            await t.test(`${entrypoint}: isolated startup, validation and native Argon2`, async () => {
+            await t.test(`${entrypoint}: isolated startup and validation`, async () => {
                 const {output} = await build({
                     files: {[entrypoint]: new FileFsRef({fsPath: path.join(source, entrypoint)})},
                     entrypoint, workPath: source, meta: {}, considerBuildCommand: true,
@@ -69,6 +69,14 @@ test('Vercel packages login and register with the PostgreSQL Node entrypoint', a
                         if (previous[index] === undefined) delete process.env[key];
                         else process.env[key] = previous[index];
                     });
+                }
+                if (entrypoint === 'api/message.js') {
+                    const response = {status(code) { this.code = code; return this; },
+                        setHeader() {}, json(body) { this.body = body; return this; }};
+                    await route({method: 'GET', headers: {}, query: {userId: '2'}}, response);
+                    assert.equal(response.code, 401);
+                    assert.equal(response.body.code, 'UNAUTHORIZED');
+                    return;
                 }
                 const get = await route.fetch(new Request('https://urc.invalid/' + entrypoint));
                 assert.equal(get.status, 405);

@@ -39,9 +39,15 @@ function memoryStorage() {
 
 function harness(options = {}) {
     let now = 0;
+    const clockBase = Date.now();
+    class ClockDate extends Date {
+        constructor(...args) { super(...(args.length ? args : [clockBase + now])); }
+        static now() { return clockBase + now; }
+    }
     const logs = [];
     const sessions = new Map();
-    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0};
+    const messageSets = new Map();
+    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0, eval: 0, lookup: 0};
     const users = new Map([[fixture.username, {user_id: fixture.id, username: fixture.username,
         email: fixture.email, external_id: fixture.externalId,
         password: createHash('sha256').update(fixture.username + fixture.password).digest('base64')}]]);
@@ -60,10 +66,43 @@ function harness(options = {}) {
             sessions.set(key, {user, expiresAt: now + ex * 1000, ttl: ex});
         },
         async hset() { calls.hset++; },
+        async eval(script, keys, args) {
+            calls.eval++;
+            if (options.messageError) throw options.messageError;
+            assert.equal(keys.length, 1);
+            const key = keys[0];
+            if (messageSets.get(key)?.expiresAt <= now) messageSets.delete(key);
+            if (script.includes("'ZADD'")) {
+                assert.match(script, /'EXPIRE'/);
+                assert.match(script, /'ZREMRANGEBYRANK'/);
+                const [json, score, ttl, cutoff, limit] = args;
+                const entry = messageSets.get(key) ?? {values: new Map()};
+                entry.values.set(json, score);
+                entry.expiresAt = now + ttl * 1000;
+                for (const [member, time] of entry.values) if (time <= cutoff) entry.values.delete(member);
+                const sorted = [...entry.values].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
+                for (const [member] of sorted.slice(0, Math.max(0, sorted.length - limit))) entry.values.delete(member);
+                messageSets.set(key, entry);
+                return 1;
+            }
+            if (options.evalRows !== undefined) return options.evalRows;
+            const entry = messageSets.get(key);
+            if (!entry) return [];
+            const [cutoff, limit] = args;
+            for (const [member, time] of entry.values) if (time <= cutoff) entry.values.delete(member);
+            if (entry.values.size === 0) messageSets.delete(key);
+            return [...entry.values].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+                .slice(-limit).map(([member]) => member);
+        },
     };
     const sql = async (parts, ...values) => {
         if (options.sqlError) throw options.sqlError;
         const query = parts.join('?').trim().toLowerCase();
+        if (query.startsWith('select user_id from users where user_id')) {
+            calls.lookup++;
+            const rows = (options.userRows ?? [...users.values()]).filter(user => user.user_id === values[0]);
+            return {rowCount: rows.length, rows};
+        }
         if (query.startsWith('select user_id from users where')) {
             const rows = [...users.values()].filter(row => row.username === values[0] || row.email === values[1]);
             return {rowCount: rows.length, rows};
@@ -147,22 +186,30 @@ function harness(options = {}) {
                 }
                 throw new Error('Unmocked dependency');
             },
-            Headers, Request, Response, Error, AbortController, DOMException, Buffer, crypto: webcrypto, btoa,
+            Headers, Request, Response, Error, AbortController, DOMException, Buffer, crypto: webcrypto, btoa, Date: ClockDate,
             FormData: options.FormData || FormData,
             process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
                 (...args) => logs.push(args)])),
             sessionStorage: storage,
             fetch: options.fetch || (async (url, init) => {
-                assert.equal(['/api/login', '/api/me', '/api/register', '/api/users'].includes(url), true);
-                const module = load(url.slice(1) + '.js');
-                return (url === '/api/me' || url === '/api/users' ? module.default : module.default.fetch)(new Request('https://urc.invalid' + url, init));
+                const address = new URL(url, 'https://urc.invalid');
+                const route = address.pathname;
+                assert.equal(['/api/login', '/api/me', '/api/register', '/api/users', '/api/message'].includes(route), true);
+                const module = load(route.slice(1) + '.js');
+                if (route === '/api/message') {
+                    const response = nodeResponse();
+                    await module.default({method: init?.method ?? 'GET', headers: init?.headers ?? {},
+                        body: init?.body, query: Object.fromEntries(address.searchParams)}, response);
+                    return new Response(JSON.stringify(response.payload), {status: response.statusCode, headers: response.headers});
+                }
+                return (route === '/api/me' || route === '/api/users' ? module.default : module.default.fetch)(new Request('https://urc.invalid' + url, init));
             }),
         }, {filename});
         return module.exports;
     }
     return {
-        load, storage, sessions, calls, users,
+        load, storage, sessions, calls, users, messageSets,
         advance(milliseconds) { now += milliseconds; },
         assertSafeLogs(extra = []) {
             const output = inspect(logs);
@@ -186,6 +233,8 @@ function protectedRequest(token) {
 function nodeResponse() {
     return {
         statusCode: 200, replies: 0, payload: undefined,
+        headers: {},
+        setHeader(key, value) { this.headers[key.toLowerCase()] = value; return this; },
         status(code) { this.statusCode = code; return this; },
         json(payload) { this.payload = payload; this.replies++; return this; },
         send(payload) { this.payload = payload; this.replies++; return this; },
@@ -1501,4 +1550,371 @@ test('a stored token alone cannot authorize the users thunk', async () => {
     assert.equal(result.meta.condition, true);
     assert.equal(calls, 0);
     assert.equal(store.getState().users.items.length, 0);
+});
+
+// Étape 7 : messages privés. Redis et PostgreSQL restent strictement simulés.
+const thirdPublicUser = {user_id: 3, username: 'third-fixture', last_login: null};
+const sampleMessage = (overrides = {}) => ({
+    id: '10000000-0000-4000-8000-000000000001', senderId: 1, recipientId: 2,
+    content: 'private-fixture-text', createdAt: new Date().toISOString(), ...overrides,
+});
+function messagesApp(options = {}) {
+    const app = usersApp({userRows: [...publicUsers, thirdPublicUser], ...options});
+    const slice = app.h.load('src/features/messages/messagesSlice.ts');
+    app.store.dispatch(slice.openConversation(2));
+    // Session de test isolée ; aucune connexion réelle ni token de production.
+    app.h.storage.setItem('token', unknownToken);
+    app.h.sessions.set(unknownToken, {user: {id: 1, username: fixture.username, externalId: fixture.externalId}, expiresAt: Infinity});
+    return {...app, ...slice};
+}
+async function messageCall(h, {method = 'GET', token = unknownToken, userId = '2', body} = {}) {
+    const response = nodeResponse();
+    await h.load('api/message.js').default({method, headers: token ? {Authorization: `Bearer ${token}`} : {},
+        query: {userId}, body}, response);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    assert.equal(response.replies, 1);
+    return response;
+}
+
+test('private POST identifies sender from session, stores in Redis, and returns only the message', async () => {
+    const {h} = messagesApp();
+    const response = await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'private-fixture-text', senderId: 3}});
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.payload.senderId, 1);
+    assert.equal(response.payload.recipientId, 2);
+    assert.deepEqual(Object.keys(response.payload).sort(), ['content', 'createdAt', 'id', 'recipientId', 'senderId']);
+    assert.match(response.payload.id, /^[0-9a-f-]{36}$/);
+    assert.equal(Number.isFinite(Date.parse(response.payload.createdAt)), true);
+    assert.equal(h.calls.eval, 1);
+    assert.equal(h.messageSets.size, 1);
+    assert.equal(JSON.stringify(response.payload).includes(unknownToken), false);
+    h.assertSafeLogs([unknownToken, 'private-fixture-text']);
+});
+
+for (const content of ['', '   \n\t', null, 4, 'a'.repeat(2001)]) {
+    test(`private POST refuses invalid content ${typeof content}:${typeof content === 'string' ? content.length : 'non-string'}`, async () => {
+        const {h} = messagesApp();
+        const response = await messageCall(h, {method: 'POST', body: {recipientId: 2, content}});
+        assert.equal(response.statusCode, 400);
+        assert.equal(h.calls.lookup, 0);
+        assert.equal(h.calls.eval, 0);
+    });
+}
+for (const id of [0, -1, 1.2, '2', null, 2147483648, 1]) {
+    test(`private POST refuses invalid or own recipient ${String(id)}`, async () => {
+        const {h} = messagesApp();
+        assert.equal((await messageCall(h, {method: 'POST', body: {recipientId: id, content: 'fixture'}})).statusCode, 400);
+        assert.equal(h.calls.eval, 0);
+    });
+}
+for (const id of ['0', '-1', '1.2', '02', 'invalid', '2147483648', ['2', '3'], undefined, '1']) {
+    test(`private GET refuses invalid or own userId ${String(id)}`, async () => {
+        const {h} = messagesApp();
+        const response = await messageCall(h, {userId: id === undefined ? null : id});
+        assert.equal(response.statusCode, 400);
+        assert.equal(h.calls.eval, 0);
+    });
+}
+
+test('private messages handle missing recipients, JSON, empty bodies and unsupported methods', async () => {
+    const {h} = messagesApp();
+    for (const method of ['GET', 'POST']) {
+        const response = await messageCall(h, {method, userId: '999', body: {recipientId: 999, content: 'fixture'}});
+        assert.equal(response.statusCode, 404);
+    }
+    for (const body of ['{bad-json', null, [], {}, undefined]) {
+        assert.equal((await messageCall(h, {method: 'POST', body})).statusCode, 400);
+    }
+    const method = await messageCall(h, {method: 'DELETE'});
+    assert.equal(method.statusCode, 405);
+    assert.equal(method.headers.allow, 'GET, POST');
+    assert.equal(h.calls.eval, 0);
+});
+
+for (const mode of ['absent', 'invalid', 'expired']) {
+    test(`private GET and POST refuse ${mode} sessions without SQL or message access`, async () => {
+        const {h} = messagesApp();
+        if (mode === 'expired') h.sessions.set(unknownToken, {user: {id: 1, username: fixture.username, externalId: fixture.externalId}, expiresAt: 1});
+        if (mode === 'expired') h.advance(2);
+        for (const method of ['GET', 'POST']) {
+            const response = await messageCall(h, {method, token: mode === 'absent' ? null : mode === 'invalid' ? 'bad-token' : unknownToken});
+            assert.equal(response.statusCode, 401);
+        }
+        assert.equal(h.calls.lookup, 0);
+        assert.equal(h.calls.eval, 0);
+    });
+}
+
+test('both participants read the same chronological exchange and conversations remain isolated', async () => {
+    const {h} = messagesApp();
+    const one = await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'first-private-fixture'}});
+    h.advance(10);
+    h.sessions.set(unknownToken, {user: {id: 2, username: 'recipient-fixture', externalId: 'public-two'}, expiresAt: Infinity});
+    const two = await messageCall(h, {method: 'POST', body: {recipientId: 1, content: 'second-private-fixture'}});
+    const fromTwo = await messageCall(h, {userId: '1'});
+    assert.equal(fromTwo.statusCode, 200);
+    assert.equal(JSON.stringify(fromTwo.payload), JSON.stringify([one.payload, two.payload]));
+    h.sessions.set(unknownToken, {user: {id: 1, username: fixture.username, externalId: fixture.externalId}, expiresAt: Infinity});
+    const fromOne = await messageCall(h);
+    assert.equal(JSON.stringify(fromOne.payload), JSON.stringify(fromTwo.payload));
+    await messageCall(h, {method: 'POST', body: {recipientId: 3, content: 'separate-private-fixture'}});
+    assert.equal((await messageCall(h)).payload.length, 2);
+    // Le client tiers ne peut jamais choisir l'expéditeur de sa lecture.
+    h.sessions.set(unknownToken, {user: {id: 3, username: 'third-fixture', externalId: 'public-three'}, expiresAt: Infinity});
+    const outsider = nodeResponse();
+    await h.load('api/message.js').default({method: 'GET', headers: {Authorization: `Bearer ${unknownToken}`},
+        query: {userId: '2', senderId: '1', recipientId: '2'}}, outsider);
+    assert.equal(outsider.statusCode, 200);
+    assert.equal(outsider.payload.length, 0);
+    h.assertSafeLogs([unknownToken, 'first-private-fixture', 'second-private-fixture', 'separate-private-fixture']);
+});
+
+test('Redis message storage is bounded, expires, and removes old messages in an active conversation', async () => {
+    const {h} = messagesApp();
+    const {MESSAGE_LIMIT, MESSAGE_TTL_SECONDS, conversationKey} = h.load('lib/privateMessages.js');
+    const first = await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'old-private-fixture'}});
+    h.advance(MESSAGE_TTL_SECONDS * 1000 - 1);
+    await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'recent-private-fixture'}});
+    h.advance(2);
+    const active = await messageCall(h);
+    assert.equal(active.payload.length, 1);
+    assert.equal(active.payload.some(message => message.id === first.payload.id), false);
+    assert.equal(h.messageSets.get(conversationKey(1, 2)).expiresAt > 0, true);
+    const storage = h.load('lib/messageStorage.js');
+    await Promise.all(Array.from({length: MESSAGE_LIMIT + 5}, (_, index) => storage.storeMessage(sampleMessage({
+        id: `20000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        createdAt: new Date(Date.parse(active.payload[0].createdAt) + index).toISOString(),
+    }))));
+    const bounded = await messageCall(h);
+    assert.equal(bounded.payload.length, MESSAGE_LIMIT);
+    const dates = bounded.payload.map(message => message.createdAt);
+    assert.deepEqual(Array.from(dates), [...dates].sort());
+    h.advance(MESSAGE_TTL_SECONDS * 1000 + 1);
+    assert.equal((await messageCall(h)).payload.length, 0);
+    assert.equal(h.messageSets.has(conversationKey(1, 2)), false);
+});
+
+for (const failure of ['sqlError', 'messageError', 'redisError']) {
+    test(`private messages hide ${failure} without logging private data`, async () => {
+        const {h} = messagesApp({[failure]: Object.assign(new Error('private-provider-detail'), {detail: 'private-detail'})});
+        for (const method of ['GET', 'POST']) {
+            const response = await messageCall(h, {method, body: {recipientId: 2, content: 'private-content'}});
+            assert.equal(response.statusCode, 500);
+            assert.equal(JSON.stringify(response.payload).includes('private'), false);
+        }
+        h.assertSafeLogs(['private-provider-detail', 'private-content', unknownToken]);
+    });
+}
+
+test('private backend refuses corrupt Redis history or a foreign conversation member', async () => {
+    for (const evalRows of [{bad: true}, ['{bad-json'], [sampleMessage({senderId: 3})]]) {
+        const {h} = messagesApp({evalRows});
+        assert.equal((await messageCall(h)).statusCode, 500);
+    }
+});
+
+test('messages service sends only recipient and content, validates responses and strips extras', async () => {
+    const requests = [];
+    const h = harness({fetch: async (url, init) => {
+        requests.push({url, init});
+        const message = sampleMessage({token: 'private-extra', password: 'private-extra'});
+        return Response.json(init.method === 'POST' ? message : [message], {status: init.method === 'POST' ? 201 : 200});
+    }});
+    const api = h.load('src/features/messages/messagesApi.ts');
+    const controller = new AbortController();
+    const result = await api.sendMessage(2, 'private-fixture-text', controller.signal);
+    assert.equal(JSON.stringify(result).includes('private-extra'), false);
+    assert.deepEqual(JSON.parse(requests[0].init.body), {recipientId: 2, content: 'private-fixture-text'});
+    assert.equal(requests[0].init.headers.Authorization === `Bearer ${h.storage.getItem('token')}`, true);
+    assert.equal(requests[0].init.cache, 'no-store');
+    assert.equal(requests[0].init.signal, controller.signal);
+    assert.equal((await api.fetchMessages(2)).length, 1);
+    assert.equal(requests[1].url, '/api/message?userId=2');
+    h.assertSafeLogs([h.storage.getItem('token'), 'private-fixture-text']);
+});
+
+for (const operation of ['fetchMessages', 'sendMessage']) {
+    for (const [description, makeResponse, kind] of [
+        ['400', () => new Response('private-detail', {status: 400}), 'input'],
+        ['401', () => new Response('private-detail', {status: 401}), 'unauthorized'],
+        ['404', () => new Response('private-detail', {status: 404}), 'notFound'],
+        ['500', () => new Response('private-detail', {status: 500}), 'server'],
+        ['network', () => {throw new Error('private-detail');}, 'network'],
+        ['invalid JSON', () => new Response('{bad-json', {status: operation === 'sendMessage' ? 201 : 200}), 'invalid'],
+        ['wrong participants', () => Response.json(operation === 'sendMessage' ? sampleMessage({senderId: 3, recipientId: 4})
+            : [sampleMessage({senderId: 3, recipientId: 4})], {status: operation === 'sendMessage' ? 201 : 200}), 'invalid'],
+    ]) {
+        test(`${operation}: typed ${description} rejection and session handling`, async () => {
+            const app = messagesApp({fetch: async () => makeResponse()});
+            const result = await app.store.dispatch(operation === 'fetchMessages' ? app.fetchMessages(2)
+                : app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+            assert.equal(result.payload.kind, kind);
+            assert.equal(JSON.stringify(result.payload).includes('private-detail'), false);
+            assert.equal(app.store.getState().messages.items.length, 0);
+            if (kind === 'unauthorized') {
+                assert.equal(app.store.getState().auth.status, 'anonymous');
+                assertStorageCleared(app.h.storage);
+                assert.equal(app.store.getState().messages.userId, null);
+            } else {
+                assert.equal(app.store.getState().auth.status, 'authenticated');
+                assert.equal(app.h.storage.getItem('token') === unknownToken, true);
+                assert.equal(app.store.getState().messages[operation === 'fetchMessages' ? 'readStatus' : 'sendStatus'], 'failed');
+            }
+            app.h.assertSafeLogs([unknownToken, 'private-detail', 'private-fixture-text']);
+        });
+    }
+}
+
+test('both message thunks progress through pending and fulfilled without optimistic sending', async () => {
+    const requests = [];
+    const app = messagesApp({fetch: () => {const request = deferred(); requests.push(request); return request.promise;}});
+    const reading = app.store.dispatch(app.fetchMessages(2));
+    assert.equal(app.store.getState().messages.readStatus, 'loading');
+    const sending = app.store.dispatch(app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+    assert.equal(app.store.getState().messages.sendStatus, 'loading');
+    assert.equal(app.store.getState().messages.items.length, 0);
+    requests[1].resolve(Response.json(sampleMessage(), {status: 201}));
+    assert.equal(app.sendMessage.fulfilled.match(await sending), true);
+    assert.equal(app.store.getState().messages.items.length, 1);
+    // Une lecture commencée avant l'envoi ne doit pas effacer la confirmation récente.
+    requests[0].resolve(Response.json([]));
+    assert.equal(app.fetchMessages.fulfilled.match(await reading), true);
+    assert.equal(app.store.getState().messages.items.length, 1);
+    assert.equal(app.store.getState().messages.readStatus, 'succeeded');
+    assert.equal(app.store.getState().messages.sendStatus, 'succeeded');
+});
+
+test('refresh and send confirmations deduplicate by server message ID and purge expired snapshots', async () => {
+    let calls = 0;
+    const app = messagesApp({fetch: async () => ++calls <= 2 ? Response.json([sampleMessage(), sampleMessage()]) : Response.json([])});
+    await app.store.dispatch(app.fetchMessages(2));
+    await app.store.dispatch(app.fetchMessages(2));
+    assert.equal(app.store.getState().messages.items.length, 1);
+    await app.store.dispatch(app.fetchMessages(2));
+    assert.equal(app.store.getState().messages.items.length, 0);
+});
+
+for (const lane of ['fetchMessages', 'sendMessage']) {
+    test(`${lane}: obsolete result cannot overwrite another conversation`, async () => {
+        const request = deferred();
+        const app = messagesApp({fetch: () => request.promise});
+        const old = app.store.dispatch(lane === 'fetchMessages' ? app.fetchMessages(2) : app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+        app.store.dispatch(app.openConversation(3));
+        request.resolve(Response.json(lane === 'fetchMessages' ? [sampleMessage()] : sampleMessage(), {status: lane === 'fetchMessages' ? 200 : 201}));
+        await old;
+        assert.equal(app.store.getState().messages.userId, 3);
+        assert.equal(app.store.getState().messages.items.length, 0);
+    });
+    for (const change of ['resetAuth', 'setUser', 'startChecking', 'sessionUnavailable']) {
+        test(`${lane}: ${change} clears messages and prevents late reintroduction`, async () => {
+            const request = deferred();
+            const app = messagesApp({fetch: () => request.promise});
+            const old = app.store.dispatch(lane === 'fetchMessages' ? app.fetchMessages(2) : app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+            app.store.dispatch(app.auth[change](change === 'setUser' ? {id: 3, username: 'next-fixture', externalId: 'next-public'} : undefined));
+            request.resolve(Response.json(lane === 'fetchMessages' ? [sampleMessage()] : sampleMessage(), {status: lane === 'fetchMessages' ? 200 : 201}));
+            await old;
+            assert.equal(app.store.getState().messages.items.length, 0);
+            assert.equal(app.store.getState().messages.userId, null);
+        });
+    }
+    test(`${lane}: cancellation clears loading and ignores late data`, async () => {
+        const request = deferred();
+        const app = messagesApp({fetch: () => request.promise});
+        const old = app.store.dispatch(lane === 'fetchMessages' ? app.fetchMessages(2) : app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+        old.abort();
+        assert.equal((await old).meta.aborted, true);
+        assert.equal(app.store.getState().messages[lane === 'fetchMessages' ? 'readStatus' : 'sendStatus'], 'idle');
+        request.resolve(Response.json(lane === 'fetchMessages' ? [sampleMessage()] : sampleMessage(), {status: lane === 'fetchMessages' ? 200 : 201}));
+        await flush();
+        assert.equal(app.store.getState().messages.items.length, 0);
+    });
+}
+
+test('latest history request wins and an older 401 cannot invalidate it', async () => {
+    const requests = [deferred(), deferred()]; let index = 0;
+    const app = messagesApp({fetch: () => requests[index++].promise});
+    const old = app.store.dispatch(app.fetchMessages(2));
+    const current = app.store.dispatch(app.fetchMessages(2));
+    requests[1].resolve(Response.json([sampleMessage()])); await current;
+    requests[0].resolve(new Response('', {status: 401})); await old;
+    assert.equal(app.store.getState().messages.items.length, 1);
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    assert.equal(app.h.storage.getItem('token') === unknownToken, true);
+});
+
+test('an old-token message 401 does not remove a newly stored session', async () => {
+    const request = deferred();
+    const app = messagesApp({fetch: () => request.promise});
+    const old = app.store.dispatch(app.fetchMessages(2));
+    app.h.storage.setItem('token', 'new-synthetic-session');
+    request.resolve(new Response('', {status: 401})); await old;
+    assert.equal(app.h.storage.getItem('token') === 'new-synthetic-session', true);
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+});
+
+test('messages reject a mixed or foreign conversation before it enters Redux', async () => {
+    const app = messagesApp({fetch: async () => Response.json([sampleMessage({senderId: 3})])});
+    const result = await app.store.dispatch(app.fetchMessages(2));
+    assert.equal(app.fetchMessages.rejected.match(result), true);
+    assert.equal(app.store.getState().messages.items.length, 0);
+});
+
+test('StrictMode message setup/abort/setup keeps the second request current', async () => {
+    const requests = [deferred(), deferred()]; let index = 0;
+    const app = messagesApp({fetch: () => requests[index++].promise});
+    app.store.dispatch(app.openConversation(2));
+    const first = app.store.dispatch(app.fetchMessages(2)); first.abort();
+    app.store.dispatch(app.clearMessages());
+    app.store.dispatch(app.openConversation(2));
+    const second = app.store.dispatch(app.fetchMessages(2));
+    requests[1].resolve(Response.json([sampleMessage()])); await second;
+    requests[0].resolve(Response.json([])); await first; await flush();
+    assert.equal(app.store.getState().messages.readStatus, 'succeeded');
+    assert.equal(app.store.getState().messages.items.length, 1);
+});
+
+test('private conversation markup escapes HTML and aligns participants without exposing session', async () => {
+    const app = messagesApp({fetch: async () => Response.json(publicUsers)});
+    await app.store.dispatch(app.h.load('src/features/users/usersSlice.ts').fetchUsers());
+    const message = sampleMessage({content: '<img src=x onerror=alert(1)>'});
+    const pending = app.fetchMessages.pending('fixture-read', 2);
+    app.store.dispatch(pending);
+    app.store.dispatch(app.fetchMessages.fulfilled([message, sampleMessage({id: '20000000-0000-4000-8000-000000000002', senderId: 2, recipientId: 1})], 'fixture-read', 2));
+    const markup = renderRoute(app.h, '/messages/user/2');
+    assert.match(markup, /&lt;img/);
+    assert.equal(markup.includes('<img'), false);
+    assert.match(markup, /message-sent/); assert.match(markup, /message-received/);
+    assert.match(markup, /<time/); assert.match(markup, /Actualiser/); assert.match(markup, /Envoyer/);
+    assert.equal(markup.includes(unknownToken), false);
+    assert.equal(JSON.stringify(app.store.getState()).includes(unknownToken), false);
+    app.h.assertSafeLogs([message.content, unknownToken]);
+});
+
+test('private POST accepts exactly 2000 characters', async () => {
+    const {h} = messagesApp();
+    const response = await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'a'.repeat(2000)}});
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.payload.content.length, 2000);
+});
+
+test('send service rejects invalid input before HTTP, including an undefined content', async () => {
+    let calls = 0;
+    const h = harness({fetch: async () => {calls++; throw new Error('Unexpected network');}});
+    for (const content of [undefined, null, '', '  ', 'a'.repeat(2001)]) {
+        await assert.rejects(h.load('src/features/messages/messagesApi.ts').sendMessage(2, content), error => error.kind === 'input');
+    }
+    assert.equal(calls, 0);
+});
+
+test('a second send is blocked while the current send is pending', async () => {
+    let calls = 0;
+    const request = deferred();
+    const app = messagesApp({fetch: () => {calls++; return request.promise;}});
+    const first = app.store.dispatch(app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+    const second = await app.store.dispatch(app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+    assert.equal(second.meta.condition, true);
+    assert.equal(calls, 1);
+    request.resolve(Response.json(sampleMessage(), {status: 201}));
+    await first;
+    assert.equal(app.store.getState().messages.items.length, 1);
 });

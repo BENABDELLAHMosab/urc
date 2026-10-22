@@ -1,6 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
+    "api/message.js": {
+      "includeFiles": "node_modules/@vercel/postgres/dist/**"
+    },
     "api/login.js": {
       "includeFiles": "node_modules/@vercel/postgres/dist/**"
     },
