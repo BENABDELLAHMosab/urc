@@ -1,6 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
+    "api/rooms.js": {
+      "includeFiles": "node_modules/@vercel/postgres/dist/**"
+    },
+    "api/room-messages.js": {
+      "includeFiles": "node_modules/@vercel/postgres/dist/**"
+    },
     "api/message.js": {
       "includeFiles": "node_modules/@vercel/postgres/dist/**"
     },

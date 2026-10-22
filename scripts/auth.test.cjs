@@ -47,7 +47,11 @@ function harness(options = {}) {
     const logs = [];
     const sessions = new Map();
     const messageSets = new Map();
-    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0, eval: 0, lookup: 0};
+    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0, eval: 0, lookup: 0,
+        roomList: 0, roomInsert: 0, roomLookup: 0};
+    const rooms = new Map((options.roomRows ?? [{room_id: 1, name: 'General', created_by: 4},
+        {room_id: 2, name: 'News', created_by: 4}, {room_id: 3, name: 'Random', created_by: 4}])
+        .map(room => [room.room_id, {...room}]));
     const users = new Map([[fixture.username, {user_id: fixture.id, username: fixture.username,
         email: fixture.email, external_id: fixture.externalId,
         password: createHash('sha256').update(fixture.username + fixture.password).digest('base64')}]]);
@@ -98,6 +102,20 @@ function harness(options = {}) {
     const sql = async (parts, ...values) => {
         if (options.sqlError) throw options.sqlError;
         const query = parts.join('?').trim().toLowerCase();
+        if (query.startsWith('select room_id, name from rooms')) {
+            calls.roomList++; const rows = [...rooms.values()]; return {rowCount: rows.length, rows};
+        }
+        if (query.startsWith('select room_id from rooms where room_id')) {
+            calls.roomLookup++; const rows = rooms.has(values[0]) ? [rooms.get(values[0])] : [];
+            return {rowCount: rows.length, rows};
+        }
+        if (query.startsWith('insert into rooms')) {
+            calls.roomInsert++;
+            if (options.roomInsertError) throw options.roomInsertError;
+            if ([...rooms.values()].some(room => room.name === values[0])) throw Object.assign(new Error('Unique violation'), {code: '23505'});
+            const room = {room_id: Math.max(0, ...rooms.keys()) + 1, name: values[0], created_by: values[1], created_on: new ClockDate().toISOString()};
+            rooms.set(room.room_id, room); return {rowCount: 1, rows: [room]};
+        }
         if (query.startsWith('select user_id from users where user_id')) {
             calls.lookup++;
             const rows = (options.userRows ?? [...users.values()]).filter(user => user.user_id === values[0]);
@@ -200,9 +218,9 @@ function harness(options = {}) {
             fetch: options.fetch || (async (url, init) => {
                 const address = new URL(url, 'https://urc.invalid');
                 const route = address.pathname;
-                assert.equal(['/api/login', '/api/me', '/api/register', '/api/users', '/api/message'].includes(route), true);
+                assert.equal(['/api/login', '/api/me', '/api/register', '/api/users', '/api/message', '/api/rooms', '/api/room-messages'].includes(route), true);
                 const module = load(route.slice(1) + '.js');
-                if (route === '/api/message') {
+                if (['/api/message', '/api/rooms', '/api/room-messages'].includes(route)) {
                     const response = nodeResponse();
                     await module.default({method: init?.method ?? 'GET', headers: init?.headers ?? {},
                         body: init?.body, query: Object.fromEntries(address.searchParams)}, response);
@@ -214,7 +232,7 @@ function harness(options = {}) {
         return module.exports;
     }
     return {
-        load, storage, sessions, calls, users, messageSets,
+        load, storage, sessions, calls, users, messageSets, rooms,
         advance(milliseconds) { now += milliseconds; },
         assertSafeLogs(extra = []) {
             const output = inspect(logs);
@@ -1954,9 +1972,9 @@ function pollingApp(options = {}) {
     });
     store = app.store;
     return {...app, browser, timers,
-        mount(id = 2) {
+        mount(id = 2, kind = 'private') {
             cursor = 0;
-            const refresh = app.h.load('src/features/messages/useMessagePolling.ts').useMessagePolling(id);
+            const refresh = app.h.load('src/features/messages/useMessagePolling.ts').useMessagePolling(id, kind);
             const cleanup = effect();
             return {refresh, cleanup: () => cleanup?.()};
         },
@@ -2212,4 +2230,363 @@ test('an external read begun during the polling delay cancels the timer until it
     await app.advance(7999); assert.equal(calls, 2);
     await app.advance(1); assert.equal(calls, 3);
     mounted.cleanup();
+});
+
+// Étape 9 : salons publics pour les comptes authentifiés, bases simulées uniquement.
+function roomApp(options = {}) {
+    const app = messagesApp(options);
+    const roomsSlice = app.h.load('src/features/rooms/roomsSlice.ts');
+    const messageSlice = app.h.load('src/features/rooms/roomMessagesSlice.ts');
+    app.store.dispatch(messageSlice.openRoom(1));
+    return {...app, ...roomsSlice, ...messageSlice};
+}
+const roomMessage = (overrides = {}) => ({id: '50000000-0000-4000-8000-000000000001', roomId: 1,
+    senderId: 1, senderName: fixture.username, content: 'room-private-fixture', createdAt: new Date().toISOString(), ...overrides});
+async function roomCall(h, {endpoint = 'rooms', method = 'GET', token = unknownToken, roomId = '1', body} = {}) {
+    const response = nodeResponse();
+    await h.load(`api/${endpoint}.js`).default({method, headers: token ? {Authorization: `Bearer ${token}`} : {}, query: {roomId}, body}, response);
+    assert.equal(response.headers['cache-control'], 'no-store'); assert.equal(response.replies, 1);
+    return response;
+}
+
+test('rooms schema has UNIQUE VARCHAR(50), no membership or creator FK; seeded orphan creators stay visible', async () => {
+    const schema = fs.readFileSync(path.join(root, 'scripts/db.sql'), 'utf8');
+    const definition = schema.match(/CREATE TABLE rooms \(([\s\S]*?)\);/)[1];
+    assert.match(definition, /name VARCHAR \( 50 \) UNIQUE NOT NULL/);
+    assert.match(definition, /created_by INTEGER NOT NULL/);
+    assert.equal(/REFERENCES|FOREIGN KEY/i.test(definition), false);
+    const {h} = roomApp(); const response = await roomCall(h);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.payload.map(room => room.name), ['General', 'News', 'Random']);
+    assert.equal(JSON.stringify(response.payload).includes('created_by'), false);
+});
+
+test('rooms API handles empty list and creates only public output using the session creator', async () => {
+    const {h} = roomApp({roomRows: []});
+    assert.equal((await roomCall(h)).payload.length, 0);
+    const response = await roomCall(h, {method: 'POST', body: {name: '  Study room  ', created_by: 3}});
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.payload.name, 'Study room');
+    assert.deepEqual(Object.keys(response.payload).sort(), ['name', 'room_id']);
+    assert.equal(h.rooms.get(response.payload.room_id).created_by, 1);
+    assert.equal(typeof h.rooms.get(response.payload.room_id).created_on, 'string');
+    assert.equal(h.calls.roomInsert, 1);
+});
+
+for (const name of ['', '  ', 42, null, 'a'.repeat(51), 'bad\nname', 'bad\0name']) {
+    test(`room creation rejects invalid name ${typeof name}:${typeof name === 'string' ? name.length : 'not-string'}`, async () => {
+        const {h} = roomApp();
+        assert.equal((await roomCall(h, {method: 'POST', body: {name}})).statusCode, 400);
+        assert.equal(h.calls.roomInsert, 0);
+    });
+}
+
+test('room creation accepts fifty characters, rejects duplicates and concurrent duplicate insertion', async () => {
+    const {h} = roomApp();
+    assert.equal((await roomCall(h, {method: 'POST', body: {name: 'a'.repeat(50)}})).statusCode, 201);
+    assert.equal((await roomCall(h, {method: 'POST', body: {name: ' General '}})).statusCode, 409);
+    const responses = await Promise.all([1, 2].map(() => roomCall(h, {method: 'POST', body: {name: 'Concurrent room'}})));
+    assert.deepEqual(responses.map(response => response.statusCode).sort(), [201, 409]);
+    assert.equal([...h.rooms.values()].filter(room => room.name === 'Concurrent room').length, 1);
+    const forced = roomApp({roomInsertError: Object.assign(new Error('private-constraint'), {code: '23505'})});
+    assert.equal((await roomCall(forced.h, {method: 'POST', body: {name: 'Any room'}})).statusCode, 409);
+});
+
+for (const endpoint of ['rooms', 'room-messages']) {
+    for (const auth of ['missing', 'invalid', 'expired']) {
+        test(`${endpoint} GET/POST refuse ${auth} sessions before SQL or messages`, async () => {
+            const {h} = roomApp();
+            if (auth === 'expired') h.sessions.delete(unknownToken);
+            for (const method of ['GET', 'POST']) {
+                const response = await roomCall(h, {endpoint, method, token: auth === 'missing' ? null : auth === 'invalid' ? 'bad-token' : unknownToken});
+                assert.equal(response.statusCode, 401);
+            }
+            assert.equal(h.calls.roomList + h.calls.roomInsert + h.calls.roomLookup, 0);
+            assert.equal(h.calls.eval, 0);
+        });
+    }
+    test(`${endpoint} handles invalid JSON and method with safe headers`, async () => {
+        const {h} = roomApp();
+        assert.equal((await roomCall(h, {endpoint, method: 'POST', body: '{bad-json'})).statusCode, 400);
+        const response = await roomCall(h, {endpoint, method: 'DELETE'});
+        assert.equal(response.statusCode, 405); assert.equal(response.headers.allow, 'GET, POST');
+    });
+}
+
+for (const id of [0, -1, 1.2, '1', 2147483648, null]) {
+    test(`room messages POST rejects invalid ID ${String(id)}`, async () => {
+        const {h} = roomApp();
+        const response = await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: id, content: 'fixture'}});
+        assert.equal(response.statusCode, 400); assert.equal(h.calls.eval, 0);
+    });
+}
+for (const id of ['0', '-1', '1.2', '01', ['1', '2'], '2147483648']) {
+    test(`room messages GET rejects invalid ID ${String(id)}`, async () => {
+        const {h} = roomApp();
+        assert.equal((await roomCall(h, {endpoint: 'room-messages', roomId: id})).statusCode, 400);
+    });
+}
+for (const content of ['', ' \n ', null, 42, 'a'.repeat(2001)]) {
+    test(`room messages reject invalid text ${typeof content}:${typeof content === 'string' ? content.length : 'non-string'}`, async () => {
+        const {h} = roomApp();
+        assert.equal((await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 1, content}})).statusCode, 400);
+        assert.equal(h.calls.eval, 0);
+    });
+}
+
+test('room message author is the session and all authenticated participants see the same history', async () => {
+    const {h} = roomApp();
+    const sent = [];
+    for (const id of [1, 2, 3]) {
+        h.sessions.set(unknownToken, {user: {id, username: `public-fixture-${id}`, externalId: `public-id-${id}`}, expiresAt: Infinity});
+        const response = await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {
+            roomId: 1, content: 'private-group-text-' + id, senderId: 999, senderName: 'spoofed'}});
+        assert.equal(response.statusCode, 201); assert.equal(response.payload.senderId, id);
+        assert.equal(response.payload.senderName, `public-fixture-${id}`); sent.push(response.payload);
+        h.advance(10);
+    }
+    for (const id of [1, 2, 3]) {
+        h.sessions.set(unknownToken, {user: {id, username: `public-fixture-${id}`, externalId: `public-id-${id}`}, expiresAt: Infinity});
+        const response = await roomCall(h, {endpoint: 'room-messages'});
+        assert.equal(response.statusCode, 200); assert.equal(JSON.stringify(response.payload), JSON.stringify(sent));
+    }
+    h.assertSafeLogs([unknownToken, ...sent.map(message => message.content)]);
+});
+
+test('room, other room, and private conversation keys and histories remain isolated', async () => {
+    const {h} = roomApp();
+    await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 1, content: 'room-one-private'}});
+    await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 2, content: 'room-two-private'}});
+    await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'private-direct'}});
+    assert.equal((await roomCall(h, {endpoint: 'room-messages'})).payload[0].content, 'room-one-private');
+    assert.equal((await roomCall(h, {endpoint: 'room-messages', roomId: '2'})).payload[0].content, 'room-two-private');
+    assert.equal((await messageCall(h)).payload[0].content, 'private-direct');
+    assert.equal(h.messageSets.size, 3);
+    assert.equal(h.messageSets.has('urc:room:v1:1'), true);
+    assert.equal(h.messageSets.has('urc:room:v1:2'), true);
+    assert.equal(h.messageSets.has('urc:private:v1:1:2'), true);
+});
+
+test('room messages use the same atomic scripts, 100-message cap, chronology and 24h expiration', async () => {
+    const {h} = roomApp(); const storage = h.load('lib/messageStorage.js');
+    const first = await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 1, content: 'old-room-fixture'}});
+    assert.equal(first.statusCode, 201);
+    h.advance(86400000 - 1);
+    await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 1, content: 'new-room-fixture'}});
+    h.advance(2);
+    assert.equal((await roomCall(h, {endpoint: 'room-messages'})).payload.length, 1);
+    await Promise.all(Array.from({length: 110}, (_, index) => storage.storeRoomMessage(roomMessage({
+        id: `60000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        createdAt: new Date(Date.parse(first.payload.createdAt) + 86400010 + index).toISOString()}))));
+    const response = await roomCall(h, {endpoint: 'room-messages'});
+    assert.equal(response.payload.length, 100);
+    const dates = Array.from(response.payload, message => message.createdAt);
+    assert.deepEqual(dates, [...dates].sort());
+    assert.equal(h.messageSets.get('urc:room:v1:1').expiresAt > 0, true);
+    h.advance(86400001);
+    assert.equal((await roomCall(h, {endpoint: 'room-messages'})).payload.length, 0);
+    assert.equal(h.messageSets.has('urc:room:v1:1'), false);
+});
+
+test('unknown rooms and provider errors return only safe public errors', async () => {
+    const {h} = roomApp();
+    for (const method of ['GET', 'POST']) {
+        assert.equal((await roomCall(h, {endpoint: 'room-messages', roomId: '999', method,
+            body: {roomId: 999, content: 'fixture'}})).statusCode, 404);
+    }
+    for (const failure of ['sqlError', 'redisError', 'messageError']) {
+        const app = roomApp({[failure]: Object.assign(new Error('private-provider'), {detail: 'private-detail'})});
+        const endpoints = failure === 'messageError' ? ['room-messages'] : ['rooms', 'room-messages'];
+        for (const endpoint of endpoints) {
+            const response = await roomCall(app.h, {endpoint});
+            assert.equal(response.statusCode, 500); assert.equal(JSON.stringify(response.payload).includes('private'), false);
+        }
+        app.h.assertSafeLogs(['private-provider', unknownToken]);
+    }
+    const corrupt = roomApp({evalRows: [roomMessage({roomId: 2})]});
+    assert.equal((await roomCall(corrupt.h, {endpoint: 'room-messages'})).statusCode, 500);
+});
+
+test('rooms thunks expose separate pending/fulfilled statuses and protect creation from an old list', async () => {
+    const list = deferred(), creation = deferred();
+    const app = roomApp({fetch: (_, init) => init.method === 'POST' ? creation.promise : list.promise});
+    const read = app.store.dispatch(app.fetchRooms());
+    const create = app.store.dispatch(app.createRoom('New room'));
+    assert.equal(app.store.getState().rooms.status, 'loading'); assert.equal(app.store.getState().rooms.createStatus, 'loading');
+    creation.resolve(Response.json({room_id: 4, name: 'New room'}, {status: 201}));
+    assert.equal(app.createRoom.fulfilled.match(await create), true);
+    list.resolve(Response.json([])); await read;
+    assert.equal(app.store.getState().rooms.items.length, 1);
+    assert.equal(app.store.getState().rooms.items[0].name, 'New room');
+});
+
+for (const operation of ['fetchRooms', 'createRoom', 'fetchRoomMessages', 'sendRoomMessage']) {
+    for (const [status, kind] of [[400, 'input'], [401, 'unauthorized'], [404, 'notFound'], [409, 'conflict'], [500, 'server'], [0, 'network']]) {
+        test(`${operation} safely rejects ${status || 'network'} and cleans only refused sessions`, async () => {
+            const app = roomApp({fetch: async () => {
+                if (!status) throw new Error('private-network-detail');
+                return new Response('private-provider-detail', {status});
+            }});
+            const thunk = operation === 'fetchRooms' ? app.fetchRooms() : operation === 'createRoom' ? app.createRoom('Test room')
+                : operation === 'fetchRoomMessages' ? app.fetchRoomMessages(1) : app.sendRoomMessage({roomId: 1, content: 'private-room-text'});
+            const result = await app.store.dispatch(thunk);
+            assert.equal(result.payload.kind, kind); assert.equal(JSON.stringify(result.payload).includes('private-'), false);
+            if (status === 401) {
+                assert.equal(app.store.getState().auth.status, 'anonymous'); assertStorageCleared(app.h.storage);
+                assert.equal(app.store.getState().rooms.items.length, 0); assert.equal(app.store.getState().roomMessages.roomId, null);
+            } else {
+                assert.equal(app.store.getState().auth.status, 'authenticated'); assert.equal(app.h.storage.getItem('token') === unknownToken, true);
+                const state = operation.includes('RoomMessages') || operation === 'sendRoomMessage' ? app.store.getState().roomMessages : app.store.getState().rooms;
+                assert.equal(state[operation === 'fetchRooms' ? 'status' : operation === 'createRoom' ? 'createStatus' : operation === 'fetchRoomMessages' ? 'readStatus' : 'sendStatus'], 'failed');
+            }
+            app.h.assertSafeLogs([unknownToken, 'private-network-detail', 'private-provider-detail', 'private-room-text']);
+        });
+    }
+}
+
+test('room messages thunks keep reading and sending separate and deduplicate confirmations', async () => {
+    const read = deferred();
+    const app = roomApp({fetch: async (_, init) => init.method === 'POST' ? Response.json(roomMessage(), {status: 201}) : read.promise});
+    const reading = app.store.dispatch(app.fetchRoomMessages(1));
+    assert.equal(app.store.getState().roomMessages.readStatus, 'loading');
+    await app.store.dispatch(app.sendRoomMessage({roomId: 1, content: 'room-private-fixture'}));
+    assert.equal(app.store.getState().roomMessages.sendStatus, 'succeeded');
+    read.resolve(Response.json([roomMessage(), roomMessage()])); await reading;
+    assert.equal(app.store.getState().roomMessages.items.length, 1);
+    assert.equal(app.store.getState().messages.items.length, 0);
+    assert.equal(app.store.getState().roomMessages.hasLoaded, true);
+});
+
+for (const operation of ['fetchRoomMessages', 'sendRoomMessage']) {
+    test(`${operation} ignores results for another room and a cancelled request`, async () => {
+        for (const cancel of [false, true]) {
+            const request = deferred(); const app = roomApp({fetch: () => request.promise});
+            const old = app.store.dispatch(operation === 'fetchRoomMessages' ? app.fetchRoomMessages(1)
+                : app.sendRoomMessage({roomId: 1, content: 'room-private-fixture'}));
+            if (cancel) old.abort(); else app.store.dispatch(app.openRoom(2));
+            request.resolve(Response.json(operation === 'fetchRoomMessages' ? [roomMessage()] : roomMessage(), {status: operation === 'fetchRoomMessages' ? 200 : 201}));
+            await old; await flush(); assert.equal(app.store.getState().roomMessages.items.length, 0);
+        }
+    });
+}
+for (const change of ['resetAuth', 'setUser', 'startChecking', 'sessionUnavailable']) {
+    test(`${change} resets room state and ignores all late room operations`, async () => {
+        for (const operation of ['fetchRooms', 'createRoom', 'fetchRoomMessages', 'sendRoomMessage']) {
+            const request = deferred(); const app = roomApp({fetch: () => request.promise});
+            const thunk = operation === 'fetchRooms' ? app.fetchRooms() : operation === 'createRoom' ? app.createRoom('Test room')
+                : operation === 'fetchRoomMessages' ? app.fetchRoomMessages(1) : app.sendRoomMessage({roomId: 1, content: 'room-private-fixture'});
+            const old = app.store.dispatch(thunk);
+            app.store.dispatch(app.auth[change](change === 'setUser' ? {id: 3, username: 'new-user-fixture', externalId: 'new-public'} : undefined));
+            request.resolve(Response.json(operation === 'fetchRooms' ? [{room_id: 1, name: 'General'}] : operation === 'createRoom' ? {room_id: 4, name: 'Test room'}
+                : operation === 'fetchRoomMessages' ? [roomMessage()] : roomMessage(), {status: ['createRoom', 'sendRoomMessage'].includes(operation) ? 201 : 200}));
+            await old; assert.equal(app.store.getState().rooms.items.length, 0); assert.equal(app.store.getState().roomMessages.items.length, 0);
+            assert.equal(app.store.getState().roomMessages.roomId, null);
+        }
+    });
+}
+
+test('newer room history wins over an older 401 and never touches private state', async () => {
+    const requests = [deferred(), deferred()]; let index = 0;
+    const app = roomApp({fetch: () => requests[index++].promise});
+    app.store.dispatch(app.fetchMessages.pending('private-state', 2));
+    app.store.dispatch(app.fetchMessages.fulfilled([sampleMessage()], 'private-state', 2));
+    const old = app.store.dispatch(app.fetchRoomMessages(1)); const current = app.store.dispatch(app.fetchRoomMessages(1));
+    requests[1].resolve(Response.json([roomMessage()])); await current;
+    requests[0].resolve(new Response('', {status: 401})); await old;
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    assert.equal(app.store.getState().roomMessages.items.length, 1); assert.equal(app.store.getState().messages.items.length, 1);
+    assert.equal(app.h.storage.getItem('token') === unknownToken, true);
+});
+
+for (const bad of [{room_id: '1', name: 'General'}, {room_id: 1, name: ''}, null]) {
+    test(`room API client validates list entry ${bad === null ? 'null' : typeof bad.room_id}`, async () => {
+        const app = roomApp({fetch: async () => Response.json([bad])});
+        const result = await app.store.dispatch(app.fetchRooms()); assert.equal(result.payload.kind, 'invalid');
+    });
+}
+
+test('room API clients validate message shape and strip secret fields before Redux', async () => {
+    for (const value of [roomMessage({roomId: 2}), roomMessage({senderName: ''}), roomMessage({createdAt: 'bad'}), roomMessage({content: ''})]) {
+        const app = roomApp({fetch: async () => Response.json([value])});
+        assert.equal((await app.store.dispatch(app.fetchRoomMessages(1))).payload.kind, 'invalid');
+    }
+    const requests = [];
+    const app = roomApp({fetch: async (url, init) => {
+        requests.push({url, init}); return Response.json([roomMessage({token: 'private-extra-token', email: 'private-extra-email'})]);
+    }});
+    await app.store.dispatch(app.fetchRoomMessages(1));
+    assert.equal(requests[0].url, '/api/room-messages?roomId=1'); assert.equal(requests[0].init.cache, 'no-store');
+    assert.equal(requests[0].init.headers.Authorization === `Bearer ${unknownToken}`, true);
+    assert.equal(JSON.stringify(app.store.getState()).includes('private-extra'), false);
+    assert.equal(JSON.stringify(app.store.getState()).includes(unknownToken), false);
+});
+
+test('rooms pages expose real links, escaped public names and protected dynamic routes', async () => {
+    const app = roomApp({fetch: async () => Response.json([{room_id: 1, name: '<b>General</b>'}])});
+    assert.equal(renderRoute(app.h, '/rooms').includes('Nom du nouveau salon'), true);
+    await app.store.dispatch(app.fetchRooms());
+    const markup = renderRoute(app.h, '/rooms');
+    assert.match(markup, /href="\/rooms\/1"/); assert.match(markup, /&lt;b&gt;General/);
+    assert.equal(markup.includes('<b>General'), false);
+    assert.equal(markup.includes(unknownToken), false);
+    assert.match(renderRoute(app.h, '/rooms/1'), /Salon : &lt;b&gt;General/);
+    assert.match(renderRoute(app.h, '/rooms/abc'), /Identifiant de salon invalide/);
+    assert.match(renderRoute(app.h, '/rooms/999'), /Salon introuvable/);
+    app.store.dispatch(app.auth.resetAuth());
+    assert.equal(renderRoute(app.h, '/rooms/1').includes('General'), false);
+});
+
+test('direct room reload waits for session restoration then for room metadata', async () => {
+    const h = harness();
+    assert.match(renderRoute(h, '/rooms/1'), /Vérification de la session/);
+    await frontendLogin(h);
+    const store = h.load('src/app/store.ts').store;
+    store.dispatch(h.load('src/features/auth/authSlice.ts').setUser({id: 1, username: fixture.username, externalId: fixture.externalId}));
+    assert.match(renderRoute(h, '/rooms/1'), /Chargement du salon/);
+    await store.dispatch(h.load('src/features/rooms/roomsSlice.ts').fetchRooms());
+    assert.match(renderRoute(h, '/rooms/1'), /Salon : General/);
+});
+
+test('the shared polling handles rooms, StrictMode, hidden/offline suspension and cleanup', async () => {
+    let calls = 0; const old = deferred();
+    const app = pollingApp({fetch: async url => {
+        assert.equal(url, '/api/room-messages?roomId=1'); return ++calls === 1 ? old.promise : Response.json([roomMessage()]);
+    }});
+    const roomSlice = app.h.load('src/features/rooms/roomMessagesSlice.ts'); app.store.dispatch(roomSlice.openRoom(1));
+    const first = app.mount(1, 'room'); first.cleanup(); const current = app.mount(1, 'room'); await flush();
+    assert.equal(calls, 2); assert.equal(app.store.getState().roomMessages.items.length, 1);
+    await app.advance(8000); assert.equal(calls, 3);
+    app.browser.document.visibilityState = 'hidden'; app.browser.document.emit('visibilitychange');
+    await app.advance(16000); assert.equal(calls, 3);
+    app.browser.document.visibilityState = 'visible'; app.browser.document.emit('visibilitychange'); await flush(); assert.equal(calls, 4);
+    app.browser.navigator.onLine = false; app.browser.window.emit('offline'); await app.advance(16000); assert.equal(calls, 4);
+    app.browser.navigator.onLine = true; app.browser.window.emit('online'); await flush(); assert.equal(calls, 5);
+    old.resolve(Response.json([])); await flush(); assert.equal(app.store.getState().roomMessages.items.length, 1);
+    current.cleanup(); await app.advance(16000); assert.equal(calls, 5);
+});
+
+test('room polling switches room safely and stops on a current 401', async () => {
+    let calls = 0;
+    const app = pollingApp({fetch: async () => ++calls === 1 ? Response.json([roomMessage()]) : new Response('', {status: 401})});
+    const roomSlice = app.h.load('src/features/rooms/roomMessagesSlice.ts'); app.store.dispatch(roomSlice.openRoom(1));
+    const first = app.mount(1, 'room'); await flush(); first.cleanup();
+    app.store.dispatch(roomSlice.openRoom(2)); const second = app.mount(2, 'room'); await flush();
+    assert.equal(app.store.getState().auth.status, 'anonymous'); assertStorageCleared(app.h.storage);
+    await app.advance(60000); assert.equal(calls, 2); assert.equal(app.store.getState().roomMessages.items.length, 0);
+    second.cleanup();
+});
+
+test('room metadata refreshes on entry even after an older list was cached', async () => {
+    let store, effect, dependencies, calls = 0;
+    const app = roomApp({fetch: async () => Response.json(++calls === 1 ? [{room_id: 1, name: 'General'}]
+        : [{room_id: 1, name: 'General'}, {room_id: 4, name: 'Created elsewhere'}]),
+        react: {useEffect: (setup, deps) => {effect = setup; dependencies = deps;}},
+        reactRedux: {useDispatch: () => store.dispatch, useSelector: selector => selector(store.getState())},
+    });
+    store = app.store; await store.dispatch(app.fetchRooms());
+    assert.equal(store.getState().rooms.items.length, 1);
+    app.h.load('src/features/rooms/useRooms.ts').useRooms(4);
+    const cleanup = effect(); await flush();
+    assert.equal(calls, 2); assert.equal(store.getState().rooms.items.some(room => room.room_id === 4), true);
+    assert.equal(dependencies.includes(4), true); cleanup();
 });

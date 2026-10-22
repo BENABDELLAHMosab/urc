@@ -14,7 +14,7 @@ test('Vercel packages authentication and messages with the PostgreSQL Node entry
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'urc-packaging-'));
     const source = path.join(temporary, 'source');
     try {
-        const entries = ['api/login.js', 'api/register.js', 'api/message.js'];
+        const entries = ['api/login.js', 'api/register.js', 'api/message.js', 'api/rooms.js', 'api/room-messages.js'];
         const {fileList} = await nodeFileTrace(entries, {
             base: root, mixedModules: true, moduleSyncCatchall: true,
         });
@@ -70,7 +70,7 @@ test('Vercel packages authentication and messages with the PostgreSQL Node entry
                         else process.env[key] = previous[index];
                     });
                 }
-                if (entrypoint === 'api/message.js') {
+                if (['api/message.js', 'api/rooms.js', 'api/room-messages.js'].includes(entrypoint)) {
                     const response = {status(code) { this.code = code; return this; },
                         setHeader() {}, json(body) { this.body = body; return this; }};
                     await route({method: 'GET', headers: {}, query: {userId: '2'}}, response);

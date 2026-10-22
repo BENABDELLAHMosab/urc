@@ -2,10 +2,11 @@ import {useCallback, useEffect, useRef} from 'react';
 import {useDispatch, useSelector, useStore} from 'react-redux';
 import type {AppDispatch, RootState} from '../../app/store';
 import {fetchMessages} from './messagesSlice';
+import {fetchRoomMessages} from '../rooms/roomMessagesSlice';
 
 export const MESSAGE_POLL_DELAY_MS = 8000;
 
-export function useMessagePolling(recipientId: number) {
+export function useMessagePolling(recipientId: number, kind: 'private' | 'room' = 'private') {
     const dispatch = useDispatch<AppDispatch>();
     const store = useStore<RootState>();
     const auth = useSelector((state: RootState) => state.auth);
@@ -19,10 +20,16 @@ export function useMessagePolling(recipientId: number) {
         let waitingForRead = false;
         let interrupted = false;
         let resumeAfterFlight = false;
-        let request: ReturnType<ReturnType<typeof fetchMessages>> | undefined;
+        let request: ReturnType<ReturnType<typeof fetchMessages>> | ReturnType<ReturnType<typeof fetchRoomMessages>> | undefined;
+
+        const conversation = () => {
+            const state = store.getState();
+            return kind === 'room' ? {id: state.roomMessages.roomId, readStatus: state.roomMessages.readStatus}
+                : {id: state.messages.userId, readStatus: state.messages.readStatus};
+        };
 
         const current = () => !disposed && store.getState().auth === auth
-            && store.getState().messages.userId === recipientId;
+            && conversation().id === recipientId;
         const available = () => current() && document.visibilityState !== 'hidden' && navigator.onLine !== false;
         const clearTimer = () => { clearTimeout(timer); timer = undefined; };
         const schedule = () => {
@@ -32,7 +39,7 @@ export function useMessagePolling(recipientId: number) {
         const run = async () => {
             clearTimer();
             if (!available() || running) return;
-            if (store.getState().messages.readStatus === 'loading') {
+            if (conversation().readStatus === 'loading') {
                 // Une lecture équivalente existe déjà : attendre sa fin via l'abonnement.
                 waitingForRead = true;
                 return;
@@ -41,7 +48,7 @@ export function useMessagePolling(recipientId: number) {
             running = true;
             interrupted = false;
             resumeAfterFlight = false;
-            request = dispatch(fetchMessages(recipientId));
+            request = kind === 'room' ? dispatch(fetchRoomMessages(recipientId)) : dispatch(fetchMessages(recipientId));
             await request; // Un thunk RTK retourne une action, même en cas d'échec.
             request = undefined;
             running = false;
@@ -49,7 +56,7 @@ export function useMessagePolling(recipientId: number) {
             if (resumeAfterFlight) {
                 resumeAfterFlight = false;
                 void run();
-            } else if (store.getState().messages.readStatus === 'loading') waitingForRead = true;
+            } else if (conversation().readStatus === 'loading') waitingForRead = true;
             else schedule();
         };
         const unsubscribe = store.subscribe(() => {
@@ -59,13 +66,13 @@ export function useMessagePolling(recipientId: number) {
                 return;
             }
             if (running) return;
-            if (store.getState().messages.readStatus === 'loading') {
+            if (conversation().readStatus === 'loading') {
                 clearTimer();
                 waitingForRead = true;
             } else if (waitingForRead) {
                 waitingForRead = false;
                 // Une lecture annulée pendant le nettoyage StrictMode ne retarde pas le remontage.
-                if (store.getState().messages.readStatus === 'idle') void Promise.resolve().then(run);
+                if (conversation().readStatus === 'idle') void Promise.resolve().then(run);
                 else schedule();
             }
         });
@@ -93,7 +100,7 @@ export function useMessagePolling(recipientId: number) {
             window.removeEventListener('offline', onAvailability);
             window.removeEventListener('online', onAvailability);
         };
-    }, [recipientId, auth, dispatch, store]);
+    }, [recipientId, kind, auth, dispatch, store]);
 
     return useCallback(() => refresh.current(), []);
 }

@@ -12,4 +12,4 @@ export function isUserId(value: unknown): value is number;
 export function conversationKey(first: number, second: number): string;
 export function isMessageContent(value: unknown): value is string;
 export function publicMessage(value: unknown, first: number, second: number): PrivateMessage;
-export function chronologicalMessages(messages: PrivateMessage[]): PrivateMessage[];
+export function chronologicalMessages<T extends {id: string; createdAt: string}>(messages: T[]): T[];

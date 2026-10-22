@@ -6,6 +6,8 @@ import {NotFoundPage} from "./pages/NotFoundPage";
 import {ProtectedRoute} from "./routes/ProtectedRoute";
 import {RegisterPage} from "./pages/RegisterPage";
 import {ConversationPage} from "./pages/ConversationPage";
+import {RoomsPage} from './pages/RoomsPage';
+import {RoomPage} from './pages/RoomPage';
 
 function App() {
 
@@ -17,6 +19,8 @@ function App() {
           <Route element={<ProtectedRoute />}>
               <Route path="/messages" element={<MessagesPage />} />
               <Route path="/messages/user/:userId" element={<ConversationPage />} />
+              <Route path="/rooms" element={<RoomsPage />} />
+              <Route path="/rooms/:roomId" element={<RoomPage />} />
           </Route>
           <Route path="*" element={<NotFoundPage />} />
       </Routes>
