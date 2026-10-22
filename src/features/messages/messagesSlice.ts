@@ -11,6 +11,7 @@ type Status = 'idle' | 'loading' | 'succeeded' | 'failed';
 export interface MessagesState {
     userId: number | null;
     items: PrivateMessage[];
+    hasLoaded: boolean;
     readStatus: Status;
     sendStatus: Status;
     readError: string | null;
@@ -19,7 +20,7 @@ export interface MessagesState {
     sendRequestId: string | null;
     confirmedDuringFetch: PrivateMessage[];
 }
-const initialState: MessagesState = {userId: null, items: [], readStatus: 'idle', sendStatus: 'idle',
+const initialState: MessagesState = {userId: null, items: [], hasLoaded: false, readStatus: 'idle', sendStatus: 'idle',
     readError: null, sendError: null, readRequestId: null, sendRequestId: null, confirmedDuringFetch: []};
 type ThunkConfig = {state: RootState; rejectValue: MessagesFailure};
 
@@ -83,6 +84,7 @@ const messagesSlice = createSlice({
         .addCase(fetchMessages.fulfilled, (state, action) => {
             if (state.readRequestId !== action.meta.requestId) return;
             state.items = chronologicalMessages([...action.payload, ...state.confirmedDuringFetch]);
+            state.hasLoaded = true;
             state.confirmedDuringFetch = []; state.readRequestId = null; state.readStatus = 'succeeded';
         })
         .addCase(fetchMessages.rejected, (state, action) => {

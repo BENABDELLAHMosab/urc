@@ -1,10 +1,11 @@
-import React, {Fragment, useEffect, useRef, useState} from 'react';
+import React, {Fragment, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import type {FormEvent} from 'react';
 import {Link, useParams} from 'react-router-dom';
 import {useDispatch, useSelector} from 'react-redux';
 import type {AppDispatch, RootState} from '../app/store';
 import {useUsers} from '../features/users/useUsers';
-import {clearMessages, fetchMessages, openConversation, sendMessage} from '../features/messages/messagesSlice';
+import {clearMessages, openConversation, sendMessage} from '../features/messages/messagesSlice';
+import {useMessagePolling} from '../features/messages/useMessagePolling';
 import {isMessageContent, isUserId, MESSAGE_MAX_LENGTH} from '../../lib/privateMessages.js';
 import type {PublicUser} from '../features/users/usersApi';
 import type {AuthUser} from '../features/auth/authSlice';
@@ -16,16 +17,21 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
     const [draft, setDraft] = useState('');
     const active = useRef(false);
     const pendingSend = useRef<{abort: () => void} | null>(null);
+    const list = useRef<HTMLOListElement | null>(null);
+    const nearBottom = useRef(true);
     useEffect(() => {
         active.current = true;
         dispatch(openConversation(recipient.user_id));
-        const request = dispatch(fetchMessages(recipient.user_id));
         return () => {
             active.current = false;
-            request.abort(); pendingSend.current?.abort();
+            pendingSend.current?.abort();
             dispatch(clearMessages());
         };
     }, [dispatch, recipient.user_id, user]);
+    const refresh = useMessagePolling(recipient.user_id);
+    useLayoutEffect(() => {
+        if (list.current && nearBottom.current) list.current.scrollTop = list.current.scrollHeight;
+    }, [messages.items]);
 
     const submit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
@@ -40,10 +46,13 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
     const sending = current && messages.sendStatus === 'loading';
     return <section className="private-conversation" aria-label="Conversation privée">
         <h2>Conversation avec {recipient.username}</h2>
-        {(!current || messages.readStatus === 'loading') && <p role="status">Chargement des messages…</p>}
-        {current && messages.readError && <p role="alert">{messages.readError}</p>}
-        {current && messages.readStatus === 'succeeded' && messages.items.length === 0 && <p>Aucun message pour le moment.</p>}
-        <ol className="private-messages" aria-label="Messages">
+        {(!current || (!messages.hasLoaded && messages.readStatus === 'loading')) && <p role="status">Chargement des messages…</p>}
+        {current && messages.readError && <p className={messages.hasLoaded ? 'polling-error' : undefined}
+            role={messages.hasLoaded ? 'status' : 'alert'}>{messages.readError}</p>}
+        {current && messages.hasLoaded && messages.items.length === 0 && <p>Aucun message pour le moment.</p>}
+        <ol className="private-messages" aria-label="Messages" ref={list} tabIndex={0} onScroll={() => {
+            if (list.current) nearBottom.current = list.current.scrollHeight - list.current.scrollTop - list.current.clientHeight < 80;
+        }}>
             {current && messages.items.map(message => <li key={message.id}
                 className={message.senderId === user.id ? 'message-sent' : 'message-received'}>
                 <strong>{message.senderId === user.id ? 'Vous' : recipient.username}</strong>
@@ -52,7 +61,7 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
             </li>)}
         </ol>
         <button type="button" disabled={!current || messages.readStatus === 'loading'}
-            onClick={() => dispatch(fetchMessages(recipient.user_id))}>Actualiser</button>
+            onClick={refresh}>Actualiser</button>
         <form onSubmit={submit}>
             <label htmlFor="private-message">Votre message</label>
             <textarea id="private-message" name="content" value={draft} maxLength={MESSAGE_MAX_LENGTH}

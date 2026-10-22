@@ -1,5 +1,7 @@
 .private-conversation { max-width: 48rem; margin: 1rem auto; padding: 1rem; }
-.private-messages { display: flex; flex-direction: column; gap: .75rem; padding: 0; list-style: none; }
+.private-messages { display: flex; flex-direction: column; gap: .75rem; padding: 0; list-style: none; max-height: 28rem; overflow-y: auto; }
+.private-messages li { flex-shrink: 0; }
+.polling-error { font-size: .875rem; color: #6a3e00; }
 .private-messages li { max-width: 80%; padding: .75rem; border-radius: .5rem; background: #eee; overflow-wrap: anywhere; }
 .private-messages .message-sent { align-self: flex-end; background: #dceeff; }
 .private-messages .message-received { align-self: flex-start; }

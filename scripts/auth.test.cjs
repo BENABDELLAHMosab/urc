@@ -187,6 +187,11 @@ function harness(options = {}) {
                 throw new Error('Unmocked dependency');
             },
             Headers, Request, Response, Error, AbortController, DOMException, Buffer, crypto: webcrypto, btoa, Date: ClockDate,
+            setTimeout: options.browser?.setTimeout ?? setTimeout,
+            clearTimeout: options.browser?.clearTimeout ?? clearTimeout,
+            document: options.browser?.document,
+            window: options.browser?.window,
+            navigator: options.browser?.navigator,
             FormData: options.FormData || FormData,
             process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
@@ -1917,4 +1922,294 @@ test('a second send is blocked while the current send is pending', async () => {
     request.resolve(Response.json(sampleMessage(), {status: 201}));
     await first;
     assert.equal(app.store.getState().messages.items.length, 1);
+});
+
+// Étape 8 : hook réel avec Redux réel, horloge et événements navigateur simulés.
+function pollingApp(options = {}) {
+    let clock = 0, sequence = 0, store, effect;
+    const timers = new Map();
+    const refs = []; let cursor = 0;
+    function events(extra = {}) {
+        const listeners = new Map();
+        return {...extra,
+            addEventListener(type, callback) {
+                if (!listeners.has(type)) listeners.set(type, new Set());
+                listeners.get(type).add(callback);
+            },
+            removeEventListener(type, callback) {listeners.get(type)?.delete(callback);},
+            emit(type) {for (const callback of [...listeners.get(type) ?? []]) callback();},
+            count() {return [...listeners.values()].reduce((total, entries) => total + entries.size, 0);},
+        };
+    }
+    const browser = {
+        document: events({visibilityState: 'visible'}), window: events(), navigator: {onLine: true},
+        setTimeout(callback, delay) {const id = ++sequence; timers.set(id, {at: clock + delay, callback}); return id;},
+        clearTimeout(id) {timers.delete(id);},
+    };
+    const app = messagesApp({...options, browser,
+        react: {useEffect: setup => {effect = setup;}, useCallback: callback => callback,
+            useRef: initial => {const index = cursor++; return refs[index] ??= {current: initial};}},
+        reactRedux: {useDispatch: () => store.dispatch, useStore: () => store,
+            useSelector: selector => selector(store.getState())},
+    });
+    store = app.store;
+    return {...app, browser, timers,
+        mount(id = 2) {
+            cursor = 0;
+            const refresh = app.h.load('src/features/messages/useMessagePolling.ts').useMessagePolling(id);
+            const cleanup = effect();
+            return {refresh, cleanup: () => cleanup?.()};
+        },
+        async advance(milliseconds) {
+            const target = clock + milliseconds;
+            while (true) {
+                const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+                if (!next) break;
+                clock = next[1].at; timers.delete(next[0]); next[1].callback(); await flush();
+            }
+            clock = target; await flush();
+        },
+        now: () => clock,
+    };
+}
+
+test('polling loads immediately, then eight seconds after completion, adding messages without duplicates', async () => {
+    let calls = 0;
+    const app = pollingApp({fetch: async () => Response.json(++calls === 1 ? [] : [sampleMessage(), sampleMessage()])});
+    const mounted = app.mount(); await flush();
+    assert.equal(calls, 1); assert.equal(app.store.getState().messages.hasLoaded, true);
+    await app.advance(7999); assert.equal(calls, 1);
+    await app.advance(1); assert.equal(calls, 2); assert.equal(app.store.getState().messages.items.length, 1);
+    await app.advance(8000); assert.equal(calls, 3); assert.equal(app.store.getState().messages.items.length, 1);
+    mounted.cleanup();
+});
+
+test('a slow polling request never overlaps and the delay starts after its response', async () => {
+    const request = deferred(); let calls = 0;
+    const app = pollingApp({fetch: () => {calls++; return request.promise;}});
+    const mounted = app.mount();
+    await app.advance(60000);
+    assert.equal(calls, 1); assert.equal(app.timers.size, 0);
+    request.resolve(Response.json([])); await flush();
+    await app.advance(7999); assert.equal(calls, 1);
+    await app.advance(1); assert.equal(calls, 2);
+    mounted.cleanup();
+});
+
+test('polling cleanup aborts its HTTP request and removes every timer and event listener', async () => {
+    let signal, calls = 0; const request = deferred();
+    const app = pollingApp({fetch: (_, init) => {calls++; signal = init.signal; return request.promise;}});
+    const mounted = app.mount();
+    assert.equal(app.browser.document.count(), 1); assert.equal(app.browser.window.count(), 2);
+    mounted.cleanup();
+    assert.equal(signal.aborted, true);
+    assert.equal(app.timers.size, 0); assert.equal(app.browser.document.count(), 0); assert.equal(app.browser.window.count(), 0);
+    request.resolve(Response.json([sampleMessage()])); await flush();
+    await app.advance(60000); assert.equal(calls, 1); assert.equal(app.store.getState().messages.items.length, 0);
+});
+
+for (const mode of ['hidden', 'offline']) {
+    test(`polling suspends while ${mode} and immediately resumes when available`, async () => {
+        let calls = 0;
+        const app = pollingApp({fetch: async () => {calls++; return Response.json([]);}});
+        const mounted = app.mount(); await flush();
+        if (mode === 'hidden') {app.browser.document.visibilityState = 'hidden'; app.browser.document.emit('visibilitychange');}
+        else {app.browser.navigator.onLine = false; app.browser.window.emit('offline');}
+        await app.advance(60000); assert.equal(calls, 1); assert.equal(app.timers.size, 0);
+        if (mode === 'hidden') {app.browser.document.visibilityState = 'visible'; app.browser.document.emit('visibilitychange');}
+        else {app.browser.navigator.onLine = true; app.browser.window.emit('online');}
+        await flush(); assert.equal(calls, 2);
+        await app.advance(8000); assert.equal(calls, 3);
+        mounted.cleanup();
+    });
+}
+
+test('initially hidden or offline conversations wait before making any HTTP request', async () => {
+    for (const mode of ['hidden', 'offline']) {
+        let calls = 0;
+        const app = pollingApp({fetch: async () => {calls++; return Response.json([]);}});
+        if (mode === 'hidden') app.browser.document.visibilityState = 'hidden';
+        else app.browser.navigator.onLine = false;
+        const mounted = app.mount(); await app.advance(60000); assert.equal(calls, 0);
+        app.browser.document.visibilityState = 'visible'; app.browser.navigator.onLine = true;
+        app.browser.window.emit('online'); await flush(); assert.equal(calls, 1);
+        mounted.cleanup();
+    }
+});
+
+test('rapid hide/show while abort settles resumes immediately without an extra immediate loop', async () => {
+    const request = deferred(); let calls = 0;
+    const app = pollingApp({fetch: async () => ++calls === 1 ? request.promise : Response.json([])});
+    const mounted = app.mount();
+    app.browser.document.visibilityState = 'hidden'; app.browser.document.emit('visibilitychange');
+    app.browser.document.visibilityState = 'visible'; app.browser.document.emit('visibilitychange');
+    app.browser.document.visibilityState = 'hidden'; app.browser.document.emit('visibilitychange');
+    await flush();
+    app.browser.document.visibilityState = 'visible'; app.browser.document.emit('visibilitychange');
+    await flush(); assert.equal(calls, 2);
+    await app.advance(7999); assert.equal(calls, 2);
+    request.resolve(Response.json([sampleMessage()])); await flush();
+    assert.equal(app.store.getState().messages.items.length, 0);
+    mounted.cleanup();
+});
+
+test('manual refresh and polling share one request and restart the timer after completion', async () => {
+    let calls = 0; const request = deferred();
+    const app = pollingApp({fetch: async () => ++calls === 1 ? Response.json([]) : request.promise});
+    const mounted = app.mount(); await flush(); await app.advance(4000);
+    mounted.refresh(); mounted.refresh(); await flush(); assert.equal(calls, 2);
+    await app.advance(20000); assert.equal(calls, 2);
+    request.resolve(Response.json([])); await flush();
+    await app.advance(7999); assert.equal(calls, 2);
+    await app.advance(1); assert.equal(calls, 3);
+    mounted.cleanup();
+});
+
+test('polling joins an equivalent external read instead of starting another one', async () => {
+    let calls = 0; const request = deferred();
+    const app = pollingApp({fetch: async () => ++calls === 1 ? request.promise : Response.json([])});
+    const external = app.store.dispatch(app.fetchMessages(2));
+    const mounted = app.mount(); await app.advance(60000); assert.equal(calls, 1);
+    request.resolve(Response.json([])); await external; await flush();
+    await app.advance(7999); assert.equal(calls, 1);
+    await app.advance(1); assert.equal(calls, 2);
+    mounted.cleanup();
+});
+
+for (const failure of ['500', 'network']) {
+    test(`polling ${failure} keeps the session and waits eight seconds before retry`, async () => {
+        let calls = 0;
+        const app = pollingApp({fetch: async () => {calls++; if (failure === 'network') throw new Error('private-error'); return new Response('', {status: 500});}});
+        const mounted = app.mount(); await flush();
+        assert.equal(app.store.getState().messages.readStatus, 'failed');
+        assert.equal(app.h.storage.getItem('token') === unknownToken, true);
+        await app.advance(7999); assert.equal(calls, 1);
+        await app.advance(1); assert.equal(calls, 2);
+        app.h.assertSafeLogs([unknownToken, 'private-error']);
+        mounted.cleanup();
+    });
+}
+
+test('a polling 401 clears all private state and permanently stops this session loop', async () => {
+    let calls = 0;
+    const app = pollingApp({fetch: async () => ++calls === 1 ? Response.json([sampleMessage()]) : new Response('', {status: 401})});
+    const mounted = app.mount(); await flush(); assert.equal(app.store.getState().messages.items.length, 1);
+    await app.advance(8000);
+    assert.equal(app.store.getState().auth.status, 'anonymous'); assertStorageCleared(app.h.storage);
+    assert.equal(app.store.getState().messages.items.length, 0);
+    await app.advance(60000); assert.equal(calls, 2); assert.equal(app.timers.size, 0);
+    mounted.cleanup();
+});
+
+test('a send-triggered 401 also stops an active polling request', async () => {
+    let calls = 0; const pending = deferred();
+    const app = pollingApp({fetch: async (_, init) => {calls++; return init.method === 'POST' ? new Response('', {status: 401}) : pending.promise;}});
+    const mounted = app.mount();
+    await app.store.dispatch(app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+    await app.advance(60000); assert.equal(calls, 2);
+    assert.equal(app.store.getState().auth.status, 'anonymous'); assert.equal(app.timers.size, 0);
+    pending.resolve(Response.json([sampleMessage()])); await flush();
+    assert.equal(app.store.getState().messages.items.length, 0);
+    mounted.cleanup();
+});
+
+test('StrictMode setup/cleanup/setup replaces its cancelled read immediately', async () => {
+    let calls = 0; const old = deferred();
+    const app = pollingApp({fetch: async () => ++calls === 1 ? old.promise : Response.json([sampleMessage()])});
+    const first = app.mount(); first.cleanup();
+    const second = app.mount(); await flush();
+    assert.equal(calls, 2); assert.equal(app.store.getState().messages.items.length, 1);
+    assert.equal(app.timers.size, 1); assert.equal(app.browser.document.count(), 1);
+    old.resolve(Response.json([])); await flush();
+    await app.advance(8000); assert.equal(calls, 3);
+    second.cleanup();
+});
+
+test('fast conversation change aborts its polling and ignores old results', async () => {
+    const old = deferred(); const requests = [];
+    const app = pollingApp({fetch: async url => {requests.push(url); return url.includes('userId=2') ? old.promise : Response.json([]);}});
+    const first = app.mount(); first.cleanup();
+    app.store.dispatch(app.openConversation(3)); const second = app.mount(3); await flush();
+    old.resolve(Response.json([sampleMessage()])); await flush();
+    assert.equal(app.store.getState().messages.userId, 3); assert.equal(app.store.getState().messages.items.length, 0);
+    await app.advance(8000);
+    assert.equal(requests.filter(url => url.includes('userId=2')).length, 1);
+    second.cleanup();
+});
+
+test('account replacement prevents old polling from changing a new session', async () => {
+    const old = deferred(); let calls = 0;
+    const app = pollingApp({fetch: async () => {calls++; return old.promise;}});
+    const mounted = app.mount();
+    app.store.dispatch(app.auth.setUser({id: 3, username: 'new-fixture', externalId: 'new-public'}));
+    app.h.storage.setItem('token', 'replacement-fixture');
+    old.resolve(new Response('', {status: 401})); await flush(); await app.advance(60000);
+    assert.equal(calls, 1); assert.equal(app.store.getState().auth.user.id, 3);
+    assert.equal(app.h.storage.getItem('token') === 'replacement-fixture', true);
+    assert.equal(app.store.getState().messages.items.length, 0);
+    mounted.cleanup();
+});
+
+test('polling does not run on the mere presence of a stored token', async () => {
+    let calls = 0;
+    const app = pollingApp({fetch: async () => {calls++; return Response.json([]);}});
+    app.store.dispatch(app.auth.resetAuth());
+    const mounted = app.mount(); await app.advance(60000);
+    assert.equal(calls, 0); assert.equal(app.timers.size, 0); mounted.cleanup();
+});
+
+test('silent polling keeps loaded messages or empty state visible, including on failure', async () => {
+    const app = messagesApp({fetch: async () => Response.json(publicUsers)});
+    await app.store.dispatch(app.h.load('src/features/users/usersSlice.ts').fetchUsers());
+    app.store.dispatch(app.fetchMessages.pending('initial-read', 2));
+    app.store.dispatch(app.fetchMessages.fulfilled([sampleMessage()], 'initial-read', 2));
+    app.store.dispatch(app.fetchMessages.pending('poll-read', 2));
+    let markup = renderRoute(app.h, '/messages/user/2');
+    assert.equal(markup.includes('Chargement des messages'), false);
+    assert.equal(markup.includes('private-fixture-text'), true);
+    app.store.dispatch(app.fetchMessages.rejected(null, 'poll-read', 2, {kind: 'server', message: 'Actualisation indisponible.'}));
+    markup = renderRoute(app.h, '/messages/user/2');
+    assert.match(markup, /class="polling-error" role="status"/);
+    assert.equal(markup.includes('private-fixture-text'), true);
+    app.store.dispatch(app.fetchMessages.pending('empty-read', 2));
+    app.store.dispatch(app.fetchMessages.fulfilled([], 'empty-read', 2));
+    app.store.dispatch(app.fetchMessages.pending('empty-poll', 2));
+    markup = renderRoute(app.h, '/messages/user/2');
+    assert.equal(markup.includes('Aucun message pour le moment'), true);
+    assert.equal(markup.includes('Chargement des messages'), false);
+});
+
+test('a message sent during polling survives an older history snapshot', async () => {
+    const read = deferred(); let calls = 0;
+    const app = pollingApp({fetch: async (_, init) => {calls++; return init.method === 'POST' ? Response.json(sampleMessage(), {status: 201}) : read.promise;}});
+    const mounted = app.mount();
+    await app.store.dispatch(app.sendMessage({recipientId: 2, content: 'private-fixture-text'}));
+    read.resolve(Response.json([])); await flush();
+    assert.equal(app.store.getState().messages.items.length, 1); assert.equal(calls, 2);
+    assert.equal(JSON.stringify(app.store.getState()).includes(unknownToken), false);
+    app.h.assertSafeLogs([unknownToken, 'private-fixture-text']); mounted.cleanup();
+});
+
+test('hide then immediate show restarts a cancelled polling request before the normal delay', async () => {
+    const old = deferred(); let calls = 0;
+    const app = pollingApp({fetch: async () => ++calls === 1 ? old.promise : Response.json([])});
+    const mounted = app.mount();
+    app.browser.document.visibilityState = 'hidden'; app.browser.document.emit('visibilitychange');
+    app.browser.document.visibilityState = 'visible'; app.browser.document.emit('visibilitychange');
+    await flush(); assert.equal(calls, 2); assert.equal(app.timers.size, 1);
+    old.resolve(Response.json([sampleMessage()])); await flush();
+    assert.equal(app.store.getState().messages.items.length, 0);
+    mounted.cleanup();
+});
+
+test('an external read begun during the polling delay cancels the timer until its completion', async () => {
+    const externalRead = deferred(); let calls = 0;
+    const app = pollingApp({fetch: async () => ++calls === 2 ? externalRead.promise : Response.json([])});
+    const mounted = app.mount(); await flush(); await app.advance(4000);
+    const external = app.store.dispatch(app.fetchMessages(2));
+    await app.advance(20000); assert.equal(calls, 2); assert.equal(app.timers.size, 0);
+    externalRead.resolve(Response.json([])); await external; await flush();
+    await app.advance(7999); assert.equal(calls, 2);
+    await app.advance(1); assert.equal(calls, 3);
+    mounted.cleanup();
 });
