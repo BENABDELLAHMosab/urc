@@ -9,12 +9,14 @@ export interface AuthUser {
 
 interface AuthState {
     user: AuthUser | null;
-    status: "anonymous" | "authenticated";
+    status: "checking" | "authenticated" | "anonymous" | "unavailable";
+    error: string | null;
 }
 
 const initialState: AuthState = {
     user: null,
-    status: "anonymous",
+    status: "checking",
+    error: null,
 };
 
 const authSlice = createSlice({
@@ -24,12 +26,21 @@ const authSlice = createSlice({
         setUser(state, action: PayloadAction<AuthUser>) {
             state.user = action.payload;
             state.status = "authenticated";
+            state.error = null;
         },
         resetAuth() {
+            return {...initialState, status: "anonymous"};
+        },
+        startChecking() {
             return initialState;
+        },
+        sessionUnavailable(state) {
+            state.user = null;
+            state.status = "unavailable";
+            state.error = "Vérification de session impossible. Veuillez réessayer.";
         },
     },
 });
 
-export const {setUser, resetAuth} = authSlice.actions;
+export const {setUser, resetAuth, startChecking, sessionUnavailable} = authSlice.actions;
 export default authSlice.reducer;

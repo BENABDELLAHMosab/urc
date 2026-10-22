@@ -1,7 +1,7 @@
 import type {Session, SessionCallback, ErrorCallback, User} from "../model/common";
 import {CustomError} from "../model/CustomError";
 
-function clearStoredSession() {
+export function clearStoredSession() {
     for (const key of ['token', 'externalId', 'username']) {
         try {
             sessionStorage.removeItem(key);

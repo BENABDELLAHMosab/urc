@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Provider } from 'react-redux'
 import { BrowserRouter } from 'react-router-dom'
 import { store } from './app/store'
+import { AuthInitializer } from './features/auth/AuthInitializer'
 import './index.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
@@ -10,9 +11,11 @@ import reportWebVitals from './reportWebVitals';
 createRoot(document.getElementById('root')).render(
     <StrictMode>
         <Provider store={store}>
-            <BrowserRouter>
-                <App />
-            </BrowserRouter>
+            <AuthInitializer>
+                <BrowserRouter>
+                    <App />
+                </BrowserRouter>
+            </AuthInitializer>
         </Provider>
     </StrictMode>
 )

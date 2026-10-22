@@ -31,6 +31,7 @@ function memoryStorage() {
     ]);
     return {
         values,
+        getItem(key) { return values.get(key) ?? null; },
         setItem(key, value) { values.set(key, String(value)); },
         removeItem(key) { values.delete(key); },
     };
@@ -126,15 +127,16 @@ function harness(options = {}) {
                 }
                 throw new Error('Unmocked dependency');
             },
-            Headers, Request, Response, Error, crypto: webcrypto, btoa,
+            Headers, Request, Response, Error, AbortController, DOMException, crypto: webcrypto, btoa,
             FormData: options.FormData || FormData,
             process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
                 (...args) => logs.push(args)])),
             sessionStorage: storage,
             fetch: options.fetch || (async (url, init) => {
-                assert.equal(url, '/api/login');
-                return load('api/login.js').default(new Request('https://urc.invalid/api/login', init));
+                assert.equal(['/api/login', '/api/me'].includes(url), true);
+                return load(url === '/api/me' ? 'api/me.js' : 'api/login.js')
+                    .default(new Request('https://urc.invalid' + url, init));
             }),
         }, {filename});
         return module.exports;
@@ -390,12 +392,12 @@ test('successful Login markup hides the token and uses a password input', () => 
     h.assertSafeLogs([unknownToken]);
 });
 
-test('auth reducer starts anonymous and ignores unrelated actions', () => {
+test('auth reducer starts checking and ignores unrelated actions', () => {
     const reducer = harness().load('src/features/auth/authSlice.ts').default;
     const state = reducer(undefined, {type: 'unrelated'});
     assert.equal(state.user, null);
-    assert.equal(state.status, 'anonymous');
-    assert.deepEqual(Object.keys(state).sort(), ['status', 'user']);
+    assert.equal(state.status, 'checking');
+    assert.deepEqual(Object.keys(state).sort(), ['error', 'status', 'user']);
 });
 
 test('setUser synchronously records a public identity without changing the previous state', () => {
@@ -408,7 +410,7 @@ test('setUser synchronously records a public identity without changing the previ
     assert.equal(next.status, 'authenticated');
     assert.deepEqual(JSON.parse(JSON.stringify(next.user)), user);
     assert.equal(previous.user, null);
-    assert.equal(previous.status, 'anonymous');
+    assert.equal(previous.status, 'checking');
 });
 
 test('resetAuth removes the public identity without changing sessionStorage', () => {
@@ -502,13 +504,13 @@ test('failed Login clears Redux and stored authentication while preserving the e
     form.h.assertSafeLogs();
 });
 
-test('a fresh Redux store does not restore a user from sessionStorage', () => {
+test('a fresh Redux store waits for verification instead of trusting sessionStorage', () => {
     const h = harness();
     const {store} = h.load('src/app/store.ts');
     const markup = renderToStaticMarkup(createElement(Provider, {store},
         createElement(MemoryRouter, null, createElement(h.load('src/user/Login.tsx').Login))));
     assert.equal(store.getState().auth.user, null);
-    assert.equal(store.getState().auth.status, 'anonymous');
+    assert.equal(store.getState().auth.status, 'checking');
     assert.equal(h.storage.values.has('token'), true);
     assert.equal(markup.includes('Connecté'), false);
 });
@@ -536,13 +538,14 @@ test('/login renders the existing form', () => {
     assert.match(markup, /type="password"/);
 });
 
-test('/messages is accessible anonymously without a status-based redirect', () => {
+test('/messages hides private content while checking, then redirects an anonymous user', () => {
     const h = harness();
     const markup = renderRoute(h, '/messages');
-    assert.match(markup, /UBO Relay Chat/);
-    assert.match(markup, /La messagerie sera développée prochainement/);
+    assert.match(markup, /Vérification de la session/);
+    assert.equal(markup.includes('UBO Relay Chat'), false);
     assert.equal(markup.includes('Connecté'), false);
-    assert.equal(h.load('src/app/store.ts').store.getState().auth.status, 'anonymous');
+    h.load('src/app/store.ts').store.dispatch(h.load('src/features/auth/authSlice.ts').resetAuth());
+    assert.equal(renderRoute(h, '/messages').includes('UBO Relay Chat'), false);
 });
 
 test('/messages reads the public username from the existing Redux store', () => {
@@ -587,5 +590,205 @@ test('Vercel SPA fallback excludes API endpoints, Vite modules and static files'
         '/@fs/tmp/module.js', '/node_modules/.vite/deps/react.js', '/assets/index.js',
         '/index.html', '/favicon.ico', '/service-worker.js', '/manifest.json']) {
         assert.equal(pattern.test(pathname), false);
+    }
+});
+
+function meRequest(token, method = 'GET') {
+    return new Request('https://urc.invalid/api/me', {
+        method, headers: token ? {Authorization: `Bearer ${token}`} : {},
+    });
+}
+const publicUser = {id: fixture.id, username: fixture.username, externalId: fixture.externalId};
+
+test('/api/me returns only public data without extending the session', async () => {
+    const h = harness();
+    const login = await h.load('api/login.js').default(loginRequest());
+    const {token} = await login.json();
+    const expiresAt = h.sessions.get(token).expiresAt;
+    const response = await h.load('api/me.js').default(meRequest(token));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), publicUser);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.headers.get('vary'), 'Authorization');
+    assert.equal(h.sessions.get(token).expiresAt, expiresAt);
+    assert.equal(h.calls.set, 1);
+    h.assertSafeLogs();
+});
+
+test('/api/me returns uncached JSON 401 for missing, malformed, unknown and expired sessions', async () => {
+    const h = harness();
+    const login = await h.load('api/login.js').default(loginRequest());
+    const {token} = await login.json();
+    h.advance(3600001);
+    for (const candidate of [undefined, 'malformed', unknownToken, token]) {
+        const response = await h.load('api/me.js').default(meRequest(candidate));
+        assert.equal(response.status, 401);
+        assert.equal((await response.json()).code, 'UNAUTHORIZED');
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    h.assertSafeLogs();
+});
+
+test('/api/me refuses unsupported methods and distinguishes Redis failure from 401', async () => {
+    const h = harness({redisError: new Error('sensitive-provider-detail')});
+    for (const method of ['POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD']) {
+        const response = await h.load('api/me.js').default(meRequest(unknownToken, method));
+        assert.equal(response.status, 405);
+        assert.equal(response.headers.get('allow'), 'GET');
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    assert.equal(h.calls.get, 0);
+    const response = await h.load('api/me.js').default(meRequest(unknownToken));
+    assert.equal(response.status, 500);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal((await response.text()).includes('sensitive-provider-detail'), false);
+    h.assertSafeLogs(['sensitive-provider-detail']);
+});
+
+test('verification without a stored token avoids any HTTP request', async () => {
+    const storage = memoryStorage();
+    storage.removeItem('token');
+    const h = harness({storage, fetch: async () => {throw new Error('Unexpected HTTP call');}});
+    const result = await h.load('src/features/auth/sessionApi.ts').verifySession(new AbortController().signal);
+    assert.equal(result, null);
+});
+
+test('verification restores a valid session through the real /api/me handler', async () => {
+    const h = harness();
+    await frontendLogin(h);
+    const result = await h.load('src/features/auth/sessionApi.ts').verifySession(new AbortController().signal);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), publicUser);
+    assert.equal(Object.keys(result).length, 3);
+    h.assertSafeLogs();
+});
+
+test('verification of an expired session clears local authentication on 401', async () => {
+    const h = harness();
+    await frontendLogin(h);
+    h.advance(3600001);
+    assert.equal(await h.load('src/features/auth/sessionApi.ts').verifySession(new AbortController().signal), null);
+    assertStorageCleared(h.storage);
+});
+
+test('network, 500, malformed JSON and malformed success preserve the potential session', async () => {
+    for (const fetch of [
+        async () => {throw new Error('sensitive-network-detail');},
+        async () => new Response('private-provider-detail', {status: 500}),
+        async () => new Response('not-json', {status: 200}),
+        async () => Response.json({id: 1}),
+    ]) {
+        const h = harness({fetch});
+        await assert.rejects(h.load('src/features/auth/sessionApi.ts').verifySession(new AbortController().signal),
+            error => !error.message.includes('private-provider') && !error.message.includes('sensitive-network'));
+        assert.equal(h.storage.values.has('token'), true);
+        assert.equal(h.storage.values.has('username'), true);
+        h.assertSafeLogs(['sensitive-network-detail']);
+    }
+});
+
+function deferred() {
+    let resolve;
+    const promise = new Promise(done => {resolve = done;});
+    return {promise, resolve};
+}
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+function startup(options = {}) {
+    let store, effect;
+    const h = harness({...options,
+        react: {useEffect: setup => {effect = setup;}},
+        reactRedux: {
+            useDispatch: () => store.dispatch,
+            useStore: () => store,
+            useSelector: selector => selector(store.getState()),
+        },
+    });
+    store = h.load('src/app/store.ts').store;
+    return {h, store, run() {
+        h.load('src/features/auth/AuthInitializer.tsx').AuthInitializer({children: null});
+        return effect();
+    }};
+}
+
+test('initializer without a token resolves checking to anonymous', async () => {
+    const storage = memoryStorage();
+    storage.removeItem('token');
+    const app = startup({storage});
+    const cleanup = app.run();
+    await flush();
+    assert.equal(app.store.getState().auth.status, 'anonymous');
+    assert.equal(app.h.calls.get, 0);
+    cleanup();
+});
+
+test('initializer keeps loading until verification completes, then authenticates', async () => {
+    const request = deferred();
+    const app = startup({fetch: () => request.promise});
+    const cleanup = app.run();
+    assert.match(renderRoute(app.h, '/messages'), /role="status"/);
+    assert.equal(app.store.getState().auth.status, 'checking');
+    request.resolve(Response.json(publicUser));
+    await flush();
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    assert.equal(renderRoute(app.h, '/messages').includes(fixture.username), true);
+    cleanup();
+});
+
+test('a server failure blocks private content and allows a successful retry', async () => {
+    let attempt = 0;
+    const app = startup({fetch: async () => ++attempt === 1
+        ? new Response('private-detail', {status: 500}) : Response.json(publicUser)});
+    const cleanup = app.run();
+    await flush();
+    assert.equal(app.store.getState().auth.status, 'unavailable');
+    const markup = renderRoute(app.h, '/messages');
+    assert.match(markup, /Réessayer/);
+    assert.equal(markup.includes('UBO Relay Chat'), false);
+    assert.equal(markup.includes('private-detail'), false);
+    assert.equal(app.h.storage.values.has('token'), true);
+    cleanup();
+    app.store.dispatch(app.h.load('src/features/auth/authSlice.ts').startChecking());
+    const retryCleanup = app.run();
+    await flush();
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    retryCleanup();
+});
+
+test('StrictMode setup-cleanup-setup ignores the aborted 401 and completes the current request', async () => {
+    const requests = [deferred(), deferred()];
+    let calls = 0;
+    const app = startup({fetch: () => requests[calls++].promise});
+    const firstCleanup = app.run();
+    firstCleanup();
+    const secondCleanup = app.run();
+    requests[0].resolve(new Response('', {status: 401}));
+    requests[1].resolve(Response.json(publicUser));
+    await flush();
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    assert.equal(app.h.storage.values.has('token'), true);
+    assert.equal(calls, 2);
+    secondCleanup();
+});
+
+test('an old verification cannot overwrite or clear a newer successful login', async () => {
+    for (const status of [200, 401, 500]) {
+        const oldRequest = deferred();
+        let app;
+        app = startup({fetch: (url, init) => url === '/api/me' ? oldRequest.promise
+            : app.h.load('api/login.js').default(new Request('https://urc.invalid/api/login', init))});
+        const cleanup = app.run();
+        const result = await frontendLogin(app.h);
+        const session = result.successes[0];
+        app.store.dispatch(app.h.load('src/features/auth/authSlice.ts').setUser({
+            id: session.id, username: session.username, externalId: session.externalId,
+        }));
+        const latest = app.store.getState().auth;
+        oldRequest.resolve(status === 200 ? Response.json({...publicUser, username: 'stale-user'})
+            : new Response('', {status}));
+        await flush();
+        assert.equal(app.store.getState().auth === latest, true);
+        assert.equal(app.h.storage.values.get('token') === session.token, true);
+        app.h.assertSafeLogs();
+        cleanup();
     }
 });
