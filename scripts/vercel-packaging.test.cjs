@@ -10,14 +10,51 @@ const {FileFsRef, FileBlob} = require('@vercel/build-utils');
 
 const root = path.resolve(__dirname, '..');
 
+test('native ES modules load message and Beams handlers without require in module scope', async () => {
+    const {spawnSync} = require('node:child_process');
+    const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'urc-native-esm-'));
+    const marker = path.join(temporary, 'verified');
+    const script = `
+        import {writeFileSync} from 'node:fs';
+        import assert from 'node:assert/strict';
+        const beams = await import('./lib/beams.js');
+        const client = beams.getBeamsClient();
+        assert.equal(typeof client.generateToken('synthetic-esm-user').token, 'string');
+        for (const entry of ['./api/message.js', './api/beams.js']) {
+            const {default: handler} = await import(entry);
+            const response = {status(code) {this.code = code; return this;},
+                setHeader() {}, json(body) {this.body = body; return this;}};
+            await handler({method: 'GET', headers: {}, query: {}}, response);
+            assert.equal(response.code, 401);
+            assert.equal(response.body.code, 'UNAUTHORIZED');
+        }
+        writeFileSync(process.env.URC_ESM_CHECK_MARKER, 'ESM_OK');
+    `;
+    try {
+        const result = spawnSync(process.execPath,
+            ['--experimental-default-type=module', '--input-type=module', '-e', script], {
+                cwd: root, encoding: 'utf8', timeout: 15000,
+                env: {...process.env, URC_ESM_CHECK_MARKER: marker, UPSTASH_REDIS_REST_URL: 'https://redis.invalid',
+                    UPSTASH_REDIS_REST_TOKEN: 'synthetic-esm-token',
+                    PUSHER_INSTANCE_ID: 'synthetic-esm-instance', PUSHER_SECRET_KEY: 'synthetic-esm-secret'},
+            });
+        assert.equal(result.status, 0, 'Native ESM handlers must load and reject unauthenticated requests');
+        assert.equal(await fs.readFile(marker, 'utf8'), 'ESM_OK');
+    } finally {
+        await fs.rm(temporary, {recursive: true, force: true});
+    }
+});
+
 test('Vercel packages authentication and messages with the PostgreSQL Node entrypoint', async t => {
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'urc-packaging-'));
     const source = path.join(temporary, 'source');
     try {
-        const entries = ['api/login.js', 'api/register.js', 'api/message.js', 'api/rooms.js', 'api/room-messages.js'];
+        const entries = ['api/login.js', 'api/register.js', 'api/message.js', 'api/rooms.js', 'api/room-messages.js', 'api/beams.js'];
         const {fileList} = await nodeFileTrace(entries, {
             base: root, mixedModules: true, moduleSyncCatchall: true,
         });
+        assert.equal([...fileList].some(file => path.basename(file).startsWith('.env')), false,
+            'Private environment files must not be traced into server artifacts');
         for (const file of fileList) {
             assert.equal(file.startsWith('..'), false);
             const destination = path.join(source, file);
@@ -46,7 +83,8 @@ test('Vercel packages authentication and messages with the PostgreSQL Node entry
                         ...config.functions?.[entrypoint],
                     },
                 });
-                assert.equal(Object.hasOwn(output.files,
+                assert.equal(Object.keys(output.files).some(file => path.basename(file).startsWith('.env')), false);
+                if (entrypoint !== 'api/beams.js') assert.equal(Object.hasOwn(output.files,
                     'node_modules/@vercel/postgres/dist/index-node.cjs'), true);
                 // Placé à côté de source : aucune remontée vers ses node_modules possible.
                 const artifact = path.join(temporary, path.basename(entrypoint, '.js'));
@@ -70,12 +108,23 @@ test('Vercel packages authentication and messages with the PostgreSQL Node entry
                         else process.env[key] = previous[index];
                     });
                 }
-                if (['api/message.js', 'api/rooms.js', 'api/room-messages.js'].includes(entrypoint)) {
+                if (['api/message.js', 'api/rooms.js', 'api/room-messages.js', 'api/beams.js'].includes(entrypoint)) {
                     const response = {status(code) { this.code = code; return this; },
                         setHeader() {}, json(body) { this.body = body; return this; }};
                     await route({method: 'GET', headers: {}, query: {userId: '2'}}, response);
                     assert.equal(response.code, 401);
                     assert.equal(response.body.code, 'UNAUTHORIZED');
+                    if (entrypoint === 'api/beams.js') {
+                        // Signature réelle du SDK dans l'artefact isolé, aucune requête réseau.
+                        const PushNotifications = require(path.join(artifact, 'node_modules/@pusher/push-notifications-server'));
+                        const jwt = require(path.join(artifact, 'node_modules/jsonwebtoken'));
+                        const secret = 'synthetic-packaging-beams-secret';
+                        const client = new PushNotifications({instanceId: 'synthetic-instance', secretKey: secret});
+                        const result = client.generateToken('synthetic-public-user');
+                        const claims = jwt.verify(result.token, secret);
+                        assert.equal(claims.sub, 'synthetic-public-user');
+                        assert.equal(claims.exp - claims.iat, 86400);
+                    }
                     return;
                 }
                 const get = await route.fetch(new Request('https://urc.invalid/' + entrypoint));

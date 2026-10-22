@@ -1,3 +1,4 @@
+import {NotificationControls} from '../features/notifications/NotificationControls';
 import React from "react";
 import {Link} from 'react-router-dom';
 import {useUsers} from '../features/users/useUsers';
@@ -11,6 +12,7 @@ export function MessagesPage() {
             <h1>UBO Relay Chat</h1>
             {user && <p>Connecté : {user.username}</p>}
             <Link to="/rooms">Salons de discussion</Link>
+            <NotificationControls />
             <h2>Utilisateurs</h2>
             {(status === 'idle' || status === 'loading') && <p role="status">Chargement des utilisateurs…</p>}
             {status === 'failed' && <div role="alert"><p>{error}</p><button onClick={retry}>Réessayer</button></div>}

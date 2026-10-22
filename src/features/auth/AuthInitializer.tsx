@@ -1,3 +1,4 @@
+import {usePushSession} from '../notifications/usePushNotifications';
 import {useEffect} from "react";
 import type {ReactNode} from "react";
 import {useDispatch, useSelector, useStore} from "react-redux";
@@ -6,6 +7,7 @@ import {setUser, resetAuth, sessionUnavailable} from "./authSlice";
 import {verifySession} from "./sessionApi";
 
 export function AuthInitializer({children}: {children: ReactNode}) {
+    usePushSession();
     const dispatch = useDispatch<AppDispatch>();
     const reduxStore = useStore<RootState>();
     const status = useSelector((state: RootState) => state.auth.status);

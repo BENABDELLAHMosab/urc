@@ -48,7 +48,7 @@ function harness(options = {}) {
     const sessions = new Map();
     const messageSets = new Map();
     const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0, eval: 0, lookup: 0,
-        roomList: 0, roomInsert: 0, roomLookup: 0};
+        roomList: 0, roomInsert: 0, roomLookup: 0, push: []};
     const rooms = new Map((options.roomRows ?? [{room_id: 1, name: 'General', created_by: 4},
         {room_id: 2, name: 'News', created_by: 4}, {room_id: 3, name: 'Random', created_by: 4}])
         .map(room => [room.room_id, {...room}]));
@@ -116,7 +116,7 @@ function harness(options = {}) {
             const room = {room_id: Math.max(0, ...rooms.keys()) + 1, name: values[0], created_by: values[1], created_on: new ClockDate().toISOString()};
             rooms.set(room.room_id, room); return {rowCount: 1, rows: [room]};
         }
-        if (query.startsWith('select user_id from users where user_id')) {
+        if ((query.startsWith('select user_id from users where user_id') || query.startsWith('select user_id, external_id from users where user_id'))) {
             calls.lookup++;
             const rows = (options.userRows ?? [...users.values()]).filter(user => user.user_id === values[0]);
             return {rowCount: rows.length, rows};
@@ -158,6 +158,11 @@ function harness(options = {}) {
         },
     };
     class FakeBeams {
+        async publishToUsers(users, payload) {
+            calls.push.push({users, payload, writes: calls.eval});
+            if (options.pushPending) await options.pushPending;
+            if (options.pushError) throw options.pushError;
+        }
         generateToken() {
             calls.beams++;
             return {token: 'fixture-beams-token'};
@@ -167,14 +172,14 @@ function harness(options = {}) {
     const dependencies = {
         '@upstash/redis': {Redis: {fromEnv: () => redis}},
         '@vercel/postgres': {db, sql},
-        '@pusher/push-notifications-server': FakeBeams,
+        '@pusher/push-notifications-server': {default: FakeBeams},
         '@reduxjs/toolkit': require('@reduxjs/toolkit'),
         'react-redux': options.reactRedux || require('react-redux'),
         'react-router-dom': {...require('react-router-dom'), ...options.reactRouter, useLocation: options.reactRouter ? () => ({state: null}) : require('react-router-dom').useLocation},
         '@node-rs/argon2': require('@node-rs/argon2'),
         'validator/lib/isEmail.js': require('validator/lib/isEmail.js'),
         'node:crypto': require('node:crypto'),
-        react: options.react || require('react'),
+        react: {...require('react'), ...options.react},
         'react/jsx-runtime': require('react/jsx-runtime'),
     };
     function load(relativePath) {
@@ -189,7 +194,7 @@ function harness(options = {}) {
         if (cache.has(filename)) return cache.get(filename).exports;
         const module = {exports: {}};
         cache.set(filename, module);
-        const code = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
+        const code = ts.transpileModule(fs.readFileSync(filename, 'utf8').replaceAll('import.meta.env', 'process.env'), {
             fileName: filename,
             compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
                 jsx: ts.JsxEmit.ReactJSX, allowJs: true},
@@ -211,7 +216,14 @@ function harness(options = {}) {
             window: options.browser?.window,
             navigator: options.browser?.navigator,
             FormData: options.FormData || FormData,
-            process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
+            process: {loadEnvFile() {
+                calls.localConfig = (calls.localConfig ?? 0) + 1;
+                if (options.localEnv === undefined) throw new Error('NO_LOCAL_CONFIG');
+                const values = require('node:util').parseEnv(options.localEnv);
+                for (const [key, value] of Object.entries(values)) {
+                    if (this.env[key] === undefined) this.env[key] = value;
+                }
+            }, env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key', ...options.env}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
                 (...args) => logs.push(args)])),
             sessionStorage: storage,
@@ -232,7 +244,7 @@ function harness(options = {}) {
         return module.exports;
     }
     return {
-        load, storage, sessions, calls, users, messageSets, rooms,
+        load, storage, sessions, calls, users, messageSets, rooms, logs,
         advance(milliseconds) { now += milliseconds; },
         assertSafeLogs(extra = []) {
             const output = inspect(logs);
@@ -2590,3 +2602,257 @@ test('room metadata refreshes on entry even after an older list was cached', asy
     assert.equal(calls, 2); assert.equal(store.getState().rooms.items.some(room => room.room_id === 4), true);
     assert.equal(dependencies.includes(4), true); cleanup();
 });
+
+// Étape 10 : uniquement des SDK / données simulés, aucune publication réelle.
+for (const scenario of ['absent', 'expired', 'forged', 'missing-config', 'valid', 'redis-error', 'method']) {
+    test(`Beams endpoint: ${scenario}`, async () => {
+        const {h} = messagesApp({env: scenario === 'missing-config' ? {PUSHER_SECRET_KEY: ''} : {},
+            redisError: scenario === 'redis-error' ? new Error('private-provider-detail') : undefined});
+        if (scenario === 'expired') h.sessions.get(unknownToken).expiresAt = 0;
+        const response = nodeResponse();
+        await h.load('api/beams.js').default({method: scenario === 'method' ? 'POST' : 'GET',
+            ...protectedRequest(scenario === 'absent' ? null : unknownToken),
+            query: {user_id: scenario === 'forged' ? 'other-account' : fixture.externalId}}, response);
+        const expected = ['absent', 'expired', 'forged'].includes(scenario) ? 401
+            : ['missing-config', 'redis-error'].includes(scenario) ? 503 : scenario === 'method' ? 405 : 200;
+        assert.equal(response.statusCode, expected);
+        assert.equal(response.replies, 1);
+        assert.equal(response.headers['cache-control'], 'no-store');
+        assert.equal(h.calls.beams, expected === 200 ? 1 : 0);
+        assert.equal(JSON.stringify(response.payload).includes('fixture-key'), false);
+        h.assertSafeLogs([unknownToken, 'private-provider-detail', fixture.externalId]);
+    });
+}
+
+for (const scenario of ['success', 'push-failure', 'redis-failure', 'missing-config', 'recipient-not-found']) {
+    test(`private push after storage: ${scenario}`, async () => {
+        const {h} = messagesApp({userRows: scenario === 'recipient-not-found' ? [] : [{user_id: 2, external_id: 'recipient-beams-fixture'}],
+            pushError: scenario === 'push-failure' ? new Error('private-provider-detail fixture-key') : undefined,
+            messageError: scenario === 'redis-failure' ? new Error('private-redis-detail') : undefined,
+            env: scenario === 'missing-config' ? {PUSHER_INSTANCE_ID: ''} : {}});
+        const result = await messageCall(h, {method: 'POST', body: {recipientId: 2, senderId: 999,
+            externalId: 'forged-recipient', url: 'https://attacker.invalid', content: 'private-push-text'}});
+        assert.equal(result.statusCode, scenario === 'redis-failure' ? 500 : scenario === 'recipient-not-found' ? 404 : 201);
+        const publishes = ['success', 'push-failure'].includes(scenario) ? 1 : 0;
+        assert.equal(h.calls.push.length, publishes);
+        if (publishes) {
+            const call = h.calls.push[0];
+            assert.equal(call.writes, 1);
+            assert.equal(JSON.stringify(call.users), JSON.stringify(['recipient-beams-fixture']));
+            assert.equal(call.payload.web.data.path, '/messages/user/1');
+            for (const value of ['private-push-text', 'forged-recipient', fixture.externalId, unknownToken, '999', 'attacker'])
+                assert.equal(JSON.stringify(call.payload).includes(value), false);
+        }
+        assert.equal(h.messageSets.size, ['redis-failure', 'recipient-not-found'].includes(scenario) ? 0 : 1);
+        h.assertSafeLogs([unknownToken, 'private-push-text', 'fixture-key', 'private-provider-detail', 'private-redis-detail']);
+    });
+}
+test('rooms never publish push notifications', async () => {
+    const {h} = roomApp();
+    assert.equal((await roomCall(h, {endpoint: 'room-messages', method: 'POST', body: {roomId: 1, content: 'room-no-push'}})).statusCode, 201);
+    assert.equal(h.calls.push.length, 0);
+});
+
+function pushApp(options = {}) {
+    const events = []; let permission = options.permission ?? 'default'; let associated = options.previous ?? null;
+    const pending = options.startPending;
+    let stops = 0; let unauthorized = 0;
+    class Client {
+        constructor() { events.push('construct'); if (options.initError) throw options.initError; }
+        async getUserId() { return associated; }
+        async getDeviceId() { return associated ? 'test-device' : null; }
+        async start() { events.push('start'); if (options.startError) throw options.startError; if (pending) await pending.promise; }
+        async setUserId(id, provider) {
+            events.push(`associate:${id}`);
+            await provider.fetchToken(id);
+            if (options.associationError) throw options.associationError;
+            associated = id;
+        }
+        async stop() { stops++; events.push('stop'); if (options.stopError) throw new Error('private-sdk-error'); associated = null; }
+    }
+    class TokenProvider {
+        constructor(config) { assert.equal(config.url, '/api/beams'); assert.equal(config.headers.Authorization, 'Bearer test-session'); }
+        async fetchToken(id) { events.push(`authorize:${id}`); if (options.authError) throw new Error(`Unexpected status code ${options.authError}: ${options.authError === 503 ? 'PUSH_NOT_CONFIGURED, ' : ''}private-detail`); return {token: 'test-beams'}; }
+    }
+    const h = harness();
+    const controller = h.load('src/features/notifications/pushController.ts').createPushController({
+        instanceId: options.config === false ? '' : 'public-instance', supported: () => options.supported !== false,
+        permission: () => permission,
+        requestPermission: async () => {events.push('permission'); permission = options.answer ?? 'granted'; return permission;},
+        loadSDK: async () => ({Client, TokenProvider}), token: () => 'test-session', unauthorized: () => {unauthorized++;},
+    });
+    return {controller, events, h, get associated() {return associated;}, get stops() {return stops;}, get unauthorized() {return unauthorized;}};
+}
+for (const scenario of ['unconfigured', 'unsupported', 'granted', 'denied', 'refused', 'dismissed', 'auth401', 'auth503']) {
+    test(`push frontend permission/configuration: ${scenario}`, async () => {
+        const app = pushApp({config: scenario !== 'unconfigured', supported: scenario !== 'unsupported',
+            permission: scenario === 'denied' ? 'denied' : scenario === 'granted' ? 'granted' : 'default',
+            answer: scenario === 'refused' ? 'denied' : scenario === 'dismissed' ? 'default' : 'granted',
+            authError: scenario === 'auth401' ? 401 : scenario === 'auth503' ? 503 : undefined});
+        await app.controller.setIdentity('account-a');
+        assert.equal(app.events.includes('permission'), false);
+        assert.equal(app.events.includes('start'), false);
+        await app.controller.enable();
+        const expected = ['unconfigured', 'unsupported'].includes(scenario) ? scenario
+            : ['denied', 'refused'].includes(scenario) ? 'denied' : scenario === 'dismissed' ? 'disabled'
+            : scenario === 'auth401' ? 'error' : scenario === 'auth503' ? 'unconfigured' : 'active';
+        assert.equal(app.controller.getSnapshot(), expected);
+        assert.equal(app.unauthorized, scenario === 'auth401' ? 1 : 0);
+        assert.equal(app.events.filter(event => event === 'permission').length,
+            ['unconfigured', 'unsupported', 'denied', 'granted'].includes(scenario) ? 0 : 1);
+        if (expected === 'denied') {await app.controller.enable(); assert.equal(app.events.filter(event => event === 'permission').length, scenario === 'refused' ? 1 : 0);}
+        app.h.assertSafeLogs(['test-session', 'test-beams', 'private-detail']);
+    });
+}
+test('push enable, account switch, disable and logout clean old associations', async () => {
+    const app = pushApp(); let notifications = 0;
+    const unsubscribe = app.controller.subscribe(() => notifications++);
+    await app.controller.setIdentity('account-a'); await app.controller.enable();
+    assert.equal(app.associated, 'account-a');
+    await app.controller.setIdentity('account-b');
+    assert.equal(app.associated, null); assert.equal(app.controller.getSnapshot(), 'disabled');
+    await app.controller.enable(); assert.equal(app.associated, 'account-b');
+    await app.controller.disable(); assert.equal(app.associated, null);
+    await app.controller.enable(); await app.controller.setIdentity(null);
+    assert.equal(app.associated, null); assert.equal(app.controller.getSnapshot(), 'disabled');
+    assert.equal(notifications > 0, true); unsubscribe();
+});
+test('pending activation cannot associate old account after logout or a switch', async () => {
+    const pending = deferred(); const app = pushApp({startPending: pending});
+    await app.controller.setIdentity('account-a');
+    const enabling = app.controller.enable(); await flush();
+    const switching = app.controller.setIdentity('account-b'); pending.resolve();
+    await enabling; await switching;
+    assert.equal(app.associated, null);
+    assert.equal(app.events.includes('associate:account-a'), false);
+    assert.equal(app.controller.getSnapshot(), 'disabled');
+});
+test('existing association restored without automatic start or permission', async () => {
+    const app = pushApp({previous: 'account-a', permission: 'granted'});
+    await app.controller.setIdentity('account-a');
+    assert.equal(app.controller.getSnapshot(), 'active');
+    assert.equal(app.events.includes('start'), false); assert.equal(app.events.includes('permission'), false);
+});
+test('failed cleanup prevents associating a new account and can be retried', async () => {
+    const app = pushApp({previous: 'account-a', permission: 'granted', stopError: true});
+    await app.controller.setIdentity('account-b'); assert.equal(app.controller.getSnapshot(), 'error');
+    await app.controller.enable(); assert.equal(app.controller.getSnapshot(), 'error');
+    assert.equal(app.events.includes('associate:account-b'), false);
+});
+
+test('service worker sanitizes display and validates click destinations before the SDK handler', async () => {
+    const handlers = {}; const opened = []; let importedAfterClick = false;
+    const sdk = {};
+    const self = {location: {origin: 'https://urc.invalid'}, clients: {openWindow: async url => opened.push(url)},
+        addEventListener: (type, handler) => {handlers[type] = handler;}};
+    vm.runInNewContext(fs.readFileSync(path.join(root, 'public/service-worker.js'), 'utf8'), {
+        self, URL, PusherPushNotifications: sdk, importScripts: url => {
+            assert.equal(url, 'https://js.pusher.com/beams/service-worker.js'); importedAfterClick = !!handlers.notificationclick;
+        }, console: {log() {throw new Error('Unexpected SW log');}},
+    });
+    assert.equal(importedAfterClick, true);
+    for (const [input, expected] of [['/messages/user/2', '/messages/user/2'], ['https://attacker.invalid', '/messages'],
+        ['//attacker.invalid', '/messages'], ['/messages/user/2?token=sensitive', '/messages'],
+        ['/messages/user/2147483648', '/messages'], ['/messages/user/0', '/messages'], [undefined, '/messages']]) {
+        let sanitized; let work;
+        sdk.onNotificationReceived({payload: {notification: {title: 'private-title', body: 'private-text', deep_link: 'https://attacker.invalid'}, data: {path: input, token: 'secret'}},
+            pushEvent: {waitUntil: promise => {work = promise;}}, handleNotification: async payload => {sanitized = payload;}});
+        await work;
+        assert.equal(JSON.stringify(sanitized).includes('private-'), false);
+        assert.equal(JSON.stringify(sanitized).includes('secret'), false);
+        let stopped = false; let closed = false;
+        handlers.notificationclick({stopImmediatePropagation() {stopped = true;}, notification: {
+            data: {pusher: {customerPayload: sanitized}}, close() {closed = true;}}, waitUntil: promise => {work = promise;}});
+        await work; assert.equal(stopped && closed, true); assert.equal(opened.at(-1), 'https://urc.invalid' + expected);
+    }
+});
+
+test('frontend references only public Beams configuration and Vercel serves the worker as static JS', () => {
+    for (const filename of ['src/features/notifications/usePushNotifications.ts', 'src/features/notifications/pushController.ts', 'public/service-worker.js']) {
+        assert.equal(fs.readFileSync(path.join(root, filename), 'utf8').includes('PUSHER_SECRET_KEY'), false);
+    }
+    const config = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8'));
+    const pattern = new RegExp('^' + config.rewrites[0].source + '$');
+    assert.equal(pattern.test('/service-worker.js'), false);
+});
+
+test('reading private messages does not publish push', async () => {
+    const {h} = messagesApp({userRows: [{user_id: 2, external_id: 'recipient-beams-fixture'}]});
+    assert.equal((await messageCall(h)).statusCode, 200);
+    assert.equal(h.calls.push.length, 0);
+});
+test('requestPermission rejection is handled without an unhandled rejection', async () => {
+    const h = harness();
+    const controller = h.load('src/features/notifications/pushController.ts').createPushController({
+        instanceId: 'public', supported: () => true, permission: () => 'default',
+        requestPermission: async () => {throw new Error('private-permission-detail');},
+        loadSDK: async () => ({Client: class {
+            async getUserId() {return null;}
+            async stop() {}
+        }}), token: () => null, unauthorized() {},
+    });
+    await controller.setIdentity('account-a'); await controller.enable();
+    assert.equal(controller.getSnapshot(), 'error'); h.assertSafeLogs(['private-permission-detail']);
+});
+test('slow push publication cannot hold the stored message response indefinitely', async () => {
+    let timeout;
+    const {h} = messagesApp({userRows: [{user_id: 2, external_id: 'recipient-beams-fixture'}],
+        pushPending: new Promise(() => {}), browser: {setTimeout(callback, delay) {
+            timeout = delay; return setTimeout(callback, 0);
+        }}});
+    const response = await messageCall(h, {method: 'POST', body: {recipientId: 2, content: 'private-timeout-fixture'}});
+    assert.equal(response.statusCode, 201); assert.equal(timeout, 3000);
+    assert.equal(h.messageSets.size, 1); assert.equal(h.calls.push.length, 1);
+    h.assertSafeLogs(['private-timeout-fixture']);
+});
+
+for (const [failure, stage, reason] of [
+    ['redisError', 'session', 'redis_access_denied'],
+    ['sqlError', 'recipient_lookup', 'database_column_missing'],
+    ['messageError', 'history_read', 'redis_wrong_type'],
+]) {
+    test(`message diagnostics classify ${stage} without exposing provider details`, async () => {
+        const error = Object.assign(new Error('NOPERM WRONGTYPE sensitive-provider-fixture'), {code: '42703'});
+        if (failure !== 'sqlError') delete error.code;
+        if (failure === 'redisError') error.message = 'NOPERM sensitive-provider-fixture';
+        const {h} = messagesApp({[failure]: error});
+        const result = await messageCall(h);
+        assert.equal(result.statusCode, 500);
+        assert.equal(JSON.stringify(h.logs), JSON.stringify([['MESSAGES_UNAVAILABLE', {stage, reason}]]));
+        h.assertSafeLogs(['sensitive-provider-fixture']);
+    });
+}
+
+for (const scenario of ['development', 'production', 'missing-file', 'inherited', 'local-region', 'production-region', 'unspecified']) {
+    test(`Beams local environment fallback: ${scenario}`, () => {
+        const h = harness({env: {VERCEL_ENV: ['production', 'production-region'].includes(scenario) ? 'production'
+                : ['local-region', 'unspecified'].includes(scenario) ? undefined : 'development',
+            NOW_REGION: ['local-region', 'production-region'].includes(scenario) ? 'dev1' : undefined,
+            PUSHER_INSTANCE_ID: scenario === 'inherited' ? 'inherited-instance' : '',
+            PUSHER_SECRET_KEY: scenario === 'inherited' ? 'inherited-key' : ''},
+            localEnv: scenario === 'missing-file' ? undefined
+                : 'PUSHER_INSTANCE_ID=local-instance\nPUSHER_SECRET_KEY=local-test-key\n'});
+        const client = h.load('lib/beams.js').getBeamsClient();
+        assert.equal(client !== null, ['development', 'inherited', 'local-region'].includes(scenario));
+        assert.equal(h.calls.localConfig ?? 0, ['production', 'inherited', 'production-region', 'unspecified'].includes(scenario) ? 0 : 1);
+        h.assertSafeLogs(['local-test-key', 'inherited-key']);
+    });
+}
+
+for (const stage of ['initialization', 'cleanup', 'registration', 'authentication', 'association']) {
+    test(`push failures expose only safe ${stage} diagnostics`, async () => {
+        const error = new Error('Unexpected status code 400: private-error test-session test-beams');
+        const app = pushApp({initError: stage === 'initialization' ? error : undefined,
+            stopError: stage === 'cleanup', startError: stage === 'registration' ? error : undefined,
+            authError: stage === 'authentication' ? 400 : undefined,
+            associationError: stage === 'association' ? error : undefined});
+        await app.controller.setIdentity('account-a');
+        await app.controller.enable();
+        assert.equal(app.controller.getSnapshot(), 'error');
+        const failure = app.controller.getFailureSnapshot();
+        assert.equal(failure.stage, stage);
+        assert.equal(failure.httpStatus, stage === 'cleanup' ? undefined : 400);
+        for (const secret of ['private-error', 'test-session', 'test-beams']) assert.equal(JSON.stringify(failure).includes(secret), false);
+        app.h.assertSafeLogs(['private-error', 'test-session', 'test-beams']);
+    });
+}

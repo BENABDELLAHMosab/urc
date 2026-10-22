@@ -33,7 +33,11 @@ export function Login() {
                 }));
                 form.reset();
                 setError(new CustomError(""));
-                navigate("/messages", {replace: true});
+                const returnTo = location.state?.returnTo;
+                const id = typeof returnTo === 'string' ? Number(returnTo.slice('/messages/user/'.length)) : NaN;
+                const destination = typeof returnTo === 'string' && /^\/messages\/user\/[1-9]\d*$/.test(returnTo)
+                    && Number.isSafeInteger(id) && id <= 2147483647 ? returnTo : '/messages';
+                navigate(destination, {replace: true});
             }, (loginError: CustomError) => {
                 setError(loginError);
                 dispatch(resetAuth());
