@@ -1,6 +1,6 @@
 import React, {Fragment, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import type {FormEvent} from 'react';
-import {Link, useParams} from 'react-router-dom';
+import {useParams} from 'react-router-dom';
 import {useDispatch, useSelector} from 'react-redux';
 import type {AppDispatch, RootState} from '../app/store';
 import type {AuthUser} from '../features/auth/authSlice';
@@ -8,7 +8,10 @@ import type {Room} from '../features/rooms/roomsApi';
 import {useRooms} from '../features/rooms/useRooms';
 import {clearRoomMessages, openRoom, sendRoomMessage} from '../features/rooms/roomMessagesSlice';
 import {useMessagePolling} from '../features/messages/useMessagePolling';
-import {isUserId, isMessageContent, MESSAGE_MAX_LENGTH} from '../../lib/privateMessages.js';
+import {isUserId, isMessageContent} from '../../lib/privateMessages.js';
+import {AppShell} from '../components/AppShell';
+import {Directory} from '../components/Directory';
+import {ConversationHeader, MessageBubble, MessageComposer} from '../components/ConversationUI';
 import './ConversationPage.css';
 
 function RoomConversation({room, user}: {room: Room; user: AuthUser}) {
@@ -37,28 +40,20 @@ function RoomConversation({room, user}: {room: Room; user: AuthUser}) {
     const current = messages.roomId === room.room_id;
     const sending = current && messages.sendStatus === 'loading';
     return <section className="private-conversation" aria-label="Messages du salon">
-        <h2>Salon : {room.name}</h2>
-        <p>Tous les utilisateurs connectés peuvent lire et écrire ici.</p>
+        <ConversationHeader title={`Salon : ${room.name}`} subtitle="Tous les utilisateurs connectés peuvent lire et écrire ici."
+            backTo="/rooms" backLabel="Retour aux salons"
+            action={<button className="button-quiet" type="button" disabled={!current || messages.readStatus === 'loading'} onClick={refresh}>Actualiser</button>} />
         {(!current || (!messages.hasLoaded && messages.readStatus === 'loading')) && <p role="status">Chargement des messages…</p>}
         {current && messages.readError && <p role={messages.hasLoaded ? 'status' : 'alert'} className="polling-error">{messages.readError}</p>}
         {current && messages.hasLoaded && messages.items.length === 0 && <p>Aucun message dans ce salon.</p>}
         <ol className="private-messages" aria-label="Messages" tabIndex={0} ref={list} onScroll={() => {
             if (list.current) nearBottom.current = list.current.scrollHeight - list.current.scrollTop - list.current.clientHeight < 80;
         }}>
-            {current && messages.items.map(message => <li key={message.id}
-                className={message.senderId === user.id ? 'message-sent' : 'message-received'}>
-                <strong>{message.senderName}{message.senderId === user.id ? ' (vous)' : ''}</strong>
-                <p>{message.content}</p><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString('fr-FR')}</time>
-            </li>)}
+            {current && messages.items.map(message => <MessageBubble key={message.id} mine={message.senderId === user.id}
+                sender={`${message.senderName}${message.senderId === user.id ? ' (vous)' : ''}`} content={message.content} createdAt={message.createdAt} />)}
         </ol>
-        <button type="button" disabled={!current || messages.readStatus === 'loading'} onClick={refresh}>Actualiser</button>
-        <form onSubmit={submit}>
-            <label htmlFor="room-message">Votre message au salon</label>
-            <textarea id="room-message" name="content" value={draft} maxLength={MESSAGE_MAX_LENGTH} disabled={sending}
-                onChange={event => setDraft(event.target.value)} aria-describedby="room-message-help" />
-            <p id="room-message-help">1 à {MESSAGE_MAX_LENGTH} caractères, sans être vide.</p>
-            <button type="submit" disabled={!current || sending || !isMessageContent(draft)}>{sending ? 'Envoi en cours…' : 'Envoyer'}</button>
-        </form>
+        <MessageComposer id="room-message" label="Votre message au salon" draft={draft} onChange={setDraft} onSubmit={submit}
+            sending={sending} disabled={!current || sending || !isMessageContent(draft)} />
         {current && messages.sendError && <p role="alert">{messages.sendError}</p>}
     </section>;
 }
@@ -76,5 +71,10 @@ export function RoomPage() {
     else if (!room && rooms.status !== 'succeeded') content = <p role="status">Chargement du salon…</p>;
     else if (!room) content = <p role="alert">Salon introuvable.</p>;
     else if (user) content = <Fragment key={`${user.id}:${id}`}><RoomConversation room={room} user={user} /></Fragment>;
-    return <main><h1>UBO Relay Chat</h1>{content}<Link to="/rooms">Retour aux salons</Link></main>;
+    return <AppShell conversation kind="room" sidebar={<Directory title="Salons" kind="room" status={rooms.status} error={rooms.error} retry={rooms.retry} activeId={id}
+        items={rooms.items.map(item => ({id: item.room_id, label: item.name, to: `/rooms/${item.room_id}`}))} />}>
+        {!(valid && room && user) && <ConversationHeader title="Salon de discussion" subtitle=""
+            backTo="/rooms" backLabel="Retour aux salons" action={null} />}
+        {content}
+    </AppShell>;
 }

@@ -19,14 +19,15 @@ export function NotificationControls() {
         authentication: 'Impossible d’obtenir l’autorisation de notification auprès du serveur URC.',
         association: 'Pusher n’a pas pu associer ce navigateur à votre compte.',
     };
-    return <section aria-label="Notifications">
-        <h2>Notifications</h2>
+    return <section className="notification-controls" aria-label="Notifications">
         <p role="status">{labels[status]}</p>
         {status === 'error' && failure && <div role="alert">
             <p>{failures[failure.stage]}{failure.httpStatus ? ` (HTTP ${failure.httpStatus})` : ''}</p>
             {failure.cleanupFailed && failure.stage !== 'cleanup' && <p>La désassociation a également échoué ; réessayez sur ce navigateur avant de changer de compte.</p>}
         </div>}
+        <div className="notification-actions">
         {(status === 'disabled' || status === 'error') && <button onClick={() => void enable()}>Activer les notifications</button>}
         {(status === 'active' || status === 'error') && <button onClick={() => void disable()}>Désactiver les notifications</button>}
+        </div>
     </section>;
 }

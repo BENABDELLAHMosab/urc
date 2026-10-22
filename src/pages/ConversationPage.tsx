@@ -1,14 +1,17 @@
 import React, {Fragment, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import type {FormEvent} from 'react';
-import {Link, useParams} from 'react-router-dom';
+import {useParams} from 'react-router-dom';
 import {useDispatch, useSelector} from 'react-redux';
 import type {AppDispatch, RootState} from '../app/store';
 import {useUsers} from '../features/users/useUsers';
 import {clearMessages, openConversation, sendMessage} from '../features/messages/messagesSlice';
 import {useMessagePolling} from '../features/messages/useMessagePolling';
-import {isMessageContent, isUserId, MESSAGE_MAX_LENGTH} from '../../lib/privateMessages.js';
+import {isMessageContent, isUserId} from '../../lib/privateMessages.js';
 import type {PublicUser} from '../features/users/usersApi';
 import type {AuthUser} from '../features/auth/authSlice';
+import {AppShell} from '../components/AppShell';
+import {Directory} from '../components/Directory';
+import {ConversationHeader, MessageBubble, MessageComposer} from '../components/ConversationUI';
 import './ConversationPage.css';
 
 function PrivateConversation({recipient, user}: {recipient: PublicUser; user: AuthUser}) {
@@ -45,7 +48,9 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
     const current = messages.userId === recipient.user_id;
     const sending = current && messages.sendStatus === 'loading';
     return <section className="private-conversation" aria-label="Conversation privée">
-        <h2>Conversation avec {recipient.username}</h2>
+        <ConversationHeader title={`Conversation avec ${recipient.username}`} subtitle="Discussion privée"
+            backTo="/messages" backLabel="Retour aux utilisateurs"
+            action={<button className="button-quiet" type="button" disabled={!current || messages.readStatus === 'loading'} onClick={refresh}>Actualiser</button>} />
         {(!current || (!messages.hasLoaded && messages.readStatus === 'loading')) && <p role="status">Chargement des messages…</p>}
         {current && messages.readError && <p className={messages.hasLoaded ? 'polling-error' : undefined}
             role={messages.hasLoaded ? 'status' : 'alert'}>{messages.readError}</p>}
@@ -53,23 +58,11 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
         <ol className="private-messages" aria-label="Messages" ref={list} tabIndex={0} onScroll={() => {
             if (list.current) nearBottom.current = list.current.scrollHeight - list.current.scrollTop - list.current.clientHeight < 80;
         }}>
-            {current && messages.items.map(message => <li key={message.id}
-                className={message.senderId === user.id ? 'message-sent' : 'message-received'}>
-                <strong>{message.senderId === user.id ? 'Vous' : recipient.username}</strong>
-                <p>{message.content}</p>
-                <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString('fr-FR')}</time>
-            </li>)}
+            {current && messages.items.map(message => <MessageBubble key={message.id} mine={message.senderId === user.id}
+                sender={message.senderId === user.id ? 'Vous' : recipient.username} content={message.content} createdAt={message.createdAt} />)}
         </ol>
-        <button type="button" disabled={!current || messages.readStatus === 'loading'}
-            onClick={refresh}>Actualiser</button>
-        <form onSubmit={submit}>
-            <label htmlFor="private-message">Votre message</label>
-            <textarea id="private-message" name="content" value={draft} maxLength={MESSAGE_MAX_LENGTH}
-                disabled={sending} onChange={event => setDraft(event.target.value)} aria-describedby="message-help" />
-            <p id="message-help">1 à {MESSAGE_MAX_LENGTH} caractères, sans être vide.</p>
-            <button type="submit" disabled={!current || sending || !isMessageContent(draft)}>
-                {sending ? 'Envoi en cours…' : 'Envoyer'}</button>
-        </form>
+        <MessageComposer id="private-message" label="Votre message" draft={draft} onChange={setDraft} onSubmit={submit}
+            sending={sending} disabled={!current || sending || !isMessageContent(draft)} />
         {current && messages.sendError && <p role="alert">{messages.sendError}</p>}
     </section>;
 }
@@ -92,5 +85,10 @@ export function ConversationPage() {
     else if (currentUser) content = <Fragment key={`${currentUser.id}:${id}`}>
         <PrivateConversation recipient={recipient} user={currentUser} /></Fragment>;
 
-    return <main><h1>UBO Relay Chat</h1>{content}<Link to="/messages">Retour aux utilisateurs</Link></main>;
+    return <AppShell conversation sidebar={<Directory title="Utilisateurs" status={status} error={error} retry={retry} activeId={id}
+        items={items.filter(item => item.user_id !== currentUser?.id).map(item => ({id: item.user_id, label: item.username, to: `/messages/user/${item.user_id}`}))} />}>
+        {!(valid && !self && status === 'succeeded' && recipient && currentUser) && <ConversationHeader
+            title="Discussion privée" subtitle="" backTo="/messages" backLabel="Retour aux utilisateurs" action={null} />}
+        {content}
+    </AppShell>;
 }

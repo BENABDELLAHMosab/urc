@@ -10,14 +10,14 @@ export function ProtectedRoute() {
     const dispatch = useDispatch<AppDispatch>();
 
     if (status === "checking") {
-        return <p role="status">Vérification de la session…</p>;
+        return <main className="route-state"><p role="status">Vérification de la session…</p></main>;
     }
     if (status === "unavailable") {
         return (
-            <div role="alert">
+            <main className="route-state" role="alert">
                 <p>{error}</p>
                 <button onClick={() => dispatch(startChecking())}>Réessayer</button>
-            </div>
+            </main>
         );
     }
     if (status === "authenticated" && user) return <Outlet />;

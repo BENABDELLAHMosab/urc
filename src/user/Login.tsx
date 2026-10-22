@@ -45,20 +45,22 @@ export function Login() {
     };
 
     return(<>
-        <form onSubmit={handleSubmit}>
-            <input name="login" placeholder="login"/><br/>
-            <input name="password" type="password" placeholder="password"/><br/>
-            <button type="submit">connexion</button>
+        <form className="auth-form" onSubmit={handleSubmit}>
+            <label htmlFor="login-username">Nom d’utilisateur</label>
+            <input id="login-username" name="login" autoComplete="username" placeholder="Votre nom d’utilisateur" aria-invalid={!!error.message} aria-describedby={error.message ? "login-error" : undefined} />
+            <label htmlFor="login-password">Mot de passe</label>
+            <input id="login-password" name="password" type="password" autoComplete="current-password" aria-invalid={!!error.message} placeholder="Votre mot de passe" aria-describedby={error.message ? "login-error" : undefined} />
+            { error.message &&
+                <p id="login-error" role="alert">{error.message}</p>
+            }
+            <button className="button-primary" type="submit">Se connecter</button>
         </form>
             {location.state?.registrationComplete === true &&
                 <p role="status">Compte créé. Vous pouvez maintenant vous connecter.</p>
             }
-            <Link to="/register">Créer un compte</Link>
+            <Link className="auth-switch" to="/register">Créer un compte</Link>
             { status === "authenticated" && user &&
-                <span>Connecté : {user.username}</span>
-            }
-            { error.message &&
-                <span>{error.message}</span>
+                <span className="auth-session">Connecté : {user.username}</span>
             }
         </>
     );

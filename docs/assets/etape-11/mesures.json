@@ -1,0 +1,189 @@
+[
+  {
+    "name": "desktop-login",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440
+  },
+  {
+    "name": "desktop-register",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440
+  },
+  {
+    "name": "desktop-register-errors",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440
+  },
+  {
+    "name": "desktop-404",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440
+  },
+  {
+    "name": "desktop-users",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-private",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-send-error",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-rooms",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-group",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-notifications",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-notifications-active",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-loading",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "desktop-users-error",
+    "width": 1440,
+    "height": 900,
+    "scrollWidth": 1440,
+    "headerTop": 0,
+    "titleTop": 28,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-login",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390
+  },
+  {
+    "name": "mobile-register",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390
+  },
+  {
+    "name": "mobile-register-errors",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390
+  },
+  {
+    "name": "mobile-users",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "headerTop": 0,
+    "titleTop": 0,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-notifications",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 378,
+    "headerTop": 0,
+    "titleTop": 0,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-private",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-compact-height",
+    "width": 390,
+    "height": 500,
+    "scrollWidth": 390,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-rooms",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 378,
+    "headerTop": 579.5499877929688,
+    "titleTop": 600.5499877929688,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-room-create",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 378,
+    "headerTop": 483.54998779296875,
+    "titleTop": 504.54998779296875,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-group",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-long-message",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390,
+    "mainScroll": 0
+  },
+  {
+    "name": "mobile-404",
+    "width": 390,
+    "height": 844,
+    "scrollWidth": 390
+  }
+]

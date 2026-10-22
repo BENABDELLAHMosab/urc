@@ -1154,12 +1154,12 @@ function registrationForm(options = {}) {
     };
     return {h, state, navigations, render,
         fill(data) {
-            const form = render().props.children[1];
+            const form = render().props.children.find(child => child?.type === 'form');
             for (const input of form.props.children.filter(child => child?.type === 'input')) {
                 input.props.onChange({target: {value: data[input.props.name]}});
             }
         },
-        submit() {return render().props.children[1].props.onSubmit({preventDefault() {}});},
+        submit() {return render().props.children.find(child => child?.type === 'form').props.onSubmit({preventDefault() {}});},
     };
 }
 
@@ -1183,9 +1183,9 @@ test('registration form displays pending, disables submit, and navigates after s
     const completion = form.submit();
     assert.equal(form.state[4], true);
     const markup = form.render();
-    const button = markup.props.children[1].props.children.find(child => child?.type === 'button');
+    const button = markup.props.children.find(child => child?.type === 'form').props.children.find(child => child?.type === 'button');
     assert.equal(button.props.disabled, true);
-    assert.equal(markup.props.children[2].props.role, 'status');
+    assert.equal(markup.props.children.some(child => child?.props?.role === 'status'), true);
     assert.equal(form.navigations.length, 0);
     request.resolve(Response.json({id: 42, username: registration.username}, {status: 201}));
     await completion;
@@ -1205,7 +1205,7 @@ test('registration shows all field errors below their inputs without calling the
     const form = registrationForm({fetch: async () => {calls++; throw new Error('Unexpected request');}});
     form.fill({username: 'a', email: 'toto@gmail..com', password: 'a'.repeat(11)});
     await form.submit();
-    const rendered = form.render().props.children[1];
+    const rendered = form.render().props.children.find(child => child?.type === 'form');
     assert.equal(rendered.props.noValidate, true);
     for (const name of ['username', 'email', 'password']) {
         const children = rendered.props.children;
@@ -1388,7 +1388,7 @@ test('users thunk pending then fulfilled updates the list and excludes the conne
     assert.equal(state.error, null);
     assert.equal(state.requestId, null);
     const markup = renderRoute(app.h, '/messages');
-    assert.match(markup, /Connecté : fixture-user/);
+    assert.match(markup.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '), /Connecté : fixture-user/);
     assert.match(markup, /href="\/messages\/user\/2"/);
     assert.equal(markup.includes('href="/messages/user/1"'), false);
     assert.equal(markup.includes(app.h.storage.getItem('token')), false);

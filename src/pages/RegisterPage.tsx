@@ -4,6 +4,7 @@ import {Link, useNavigate} from "react-router-dom";
 import {validateRegistration} from "../../lib/registration.js";
 import type {RegistrationFieldErrors} from "../../lib/registration.js";
 import {registerUser} from "../user/registerApi";
+import {AuthLayout} from '../components/AuthLayout';
 import {CustomError} from "../model/CustomError";
 
 export function RegisterPage() {
@@ -40,9 +41,8 @@ export function RegisterPage() {
     };
 
     return (
-        <main>
-            <h1>Inscription</h1>
-            <form onSubmit={handleSubmit} aria-busy={pending} noValidate>
+        <AuthLayout title="Inscription" description="Créez votre compte pour rejoindre les échanges.">
+            <form className="auth-form" onSubmit={handleSubmit} aria-busy={pending} noValidate>
                 <label htmlFor="register-username">Nom d'utilisateur</label>
                 <input id="register-username" name="username" autoComplete="username" required
                     minLength={3} maxLength={50} pattern="[A-Za-z0-9_.\-]{3,50}"
@@ -61,11 +61,11 @@ export function RegisterPage() {
                     onChange={event => setPassword(event.target.value)} disabled={pending} />
                 <p id="register-password-help">12 à 128 caractères pour le mot de passe.</p>
                 {fieldErrors.password && <p id="register-password-error" role="alert">{fieldErrors.password}</p>}
-                <button type="submit" disabled={pending}>{pending ? 'Inscription en cours…' : "S'inscrire"}</button>
+                <button className="button-primary" type="submit" disabled={pending}>{pending ? 'Inscription en cours…' : "S'inscrire"}</button>
             </form>
             {pending && <p role="status">Inscription en cours…</p>}
             {error && <p role="alert">{error}</p>}
-            <Link to="/login">Retour à la connexion</Link>
-        </main>
+            <Link className="auth-switch" to="/login">Retour à la connexion</Link>
+        </AuthLayout>
     );
 }
