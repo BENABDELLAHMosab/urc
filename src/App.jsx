@@ -5,6 +5,7 @@ import {MessagesPage} from "./pages/MessagesPage";
 import {NotFoundPage} from "./pages/NotFoundPage";
 import {ProtectedRoute} from "./routes/ProtectedRoute";
 import {RegisterPage} from "./pages/RegisterPage";
+import {ConversationPage} from "./pages/ConversationPage";
 
 function App() {
 
@@ -15,6 +16,7 @@ function App() {
           <Route path="/register" element={<RegisterPage />} />
           <Route element={<ProtectedRoute />}>
               <Route path="/messages" element={<MessagesPage />} />
+              <Route path="/messages/user/:userId" element={<ConversationPage />} />
           </Route>
           <Route path="*" element={<NotFoundPage />} />
       </Routes>

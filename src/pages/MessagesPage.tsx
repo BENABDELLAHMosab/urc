@@ -1,15 +1,23 @@
 import React from "react";
-import {useSelector} from "react-redux";
-import type {RootState} from "../app/store";
+import {Link} from 'react-router-dom';
+import {useUsers} from '../features/users/useUsers';
 
 export function MessagesPage() {
-    const user = useSelector((state: RootState) => state.auth.user);
+    const {user, items, status, error, retry} = useUsers();
+    const others = items.filter(item => item.user_id !== user?.id);
 
     return (
         <main>
             <h1>UBO Relay Chat</h1>
             {user && <p>Connecté : {user.username}</p>}
-            <p>La messagerie sera développée prochainement.</p>
+            <h2>Utilisateurs</h2>
+            {(status === 'idle' || status === 'loading') && <p role="status">Chargement des utilisateurs…</p>}
+            {status === 'failed' && <div role="alert"><p>{error}</p><button onClick={retry}>Réessayer</button></div>}
+            {status === 'succeeded' && (others.length === 0
+                ? <p>Aucun autre utilisateur disponible.</p>
+                : <ul>{others.map(item => <li key={item.user_id}>
+                    <Link to={`/messages/user/${item.user_id}`}>{item.username}</Link>
+                </li>)}</ul>)}
         </main>
     );
 }

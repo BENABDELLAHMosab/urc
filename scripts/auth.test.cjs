@@ -81,7 +81,8 @@ function harness(options = {}) {
             return {rowCount: 1, rows: [{user_id: row.user_id, username: row.username}]};
         }
         calls.list++;
-        return {rowCount: 1, rows: [{user_id: fixture.id, username: fixture.username, last_login: null}]};
+        const rows = options.userRows ?? [{user_id: fixture.id, username: fixture.username, last_login: null}];
+        return {rowCount: rows.length, rows};
     };
     const db = {
         async connect() {
@@ -153,9 +154,9 @@ function harness(options = {}) {
                 (...args) => logs.push(args)])),
             sessionStorage: storage,
             fetch: options.fetch || (async (url, init) => {
-                assert.equal(['/api/login', '/api/me', '/api/register'].includes(url), true);
+                assert.equal(['/api/login', '/api/me', '/api/register', '/api/users'].includes(url), true);
                 const module = load(url.slice(1) + '.js');
-                return (url === '/api/me' ? module.default : module.default.fetch)(new Request('https://urc.invalid' + url, init));
+                return (url === '/api/me' || url === '/api/users' ? module.default : module.default.fetch)(new Request('https://urc.invalid' + url, init));
             }),
         }, {filename});
         return module.exports;
@@ -1169,4 +1170,335 @@ test('registration loads under native Node, not only through the test transpiler
     const module = await import(pathToFileURL(path.join(root, 'api/register.js')).href);
     const response = await module.default.fetch(new Request('http://fixture.invalid/api/register'));
     assert.equal(response.status, 405);
+});
+
+// Étape 6 : API utilisateurs, cycle du thunk et routes de conversation.
+const publicUsers = [
+    {user_id: fixture.id, username: fixture.username, last_login: null},
+    {user_id: 2, username: 'recipient-fixture', last_login: '22/10/2026 10:00'},
+];
+function usersApp(options = {}) {
+    const h = harness(options);
+    const store = h.load('src/app/store.ts').store;
+    const auth = h.load('src/features/auth/authSlice.ts');
+    store.dispatch(auth.setUser({id: fixture.id, username: fixture.username, externalId: fixture.externalId}));
+    return {h, store, auth, ...h.load('src/features/users/usersSlice.ts')};
+}
+
+test('GET users returns only the public SQL contract with no-store', async () => {
+    const h = harness({userRows: publicUsers.map(user => ({...user,
+        password: 'private-fingerprint', email: 'private-email', token: 'private-token'}))});
+    const login = await frontendLogin(h);
+    const token = login.successes[0].token;
+    const response = await h.load('api/users.js').default(protectedRequest(token));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await response.json(), publicUsers);
+    h.assertSafeLogs([token, 'private-fingerprint', 'private-email', 'private-token']);
+});
+
+for (const mode of ['missing', 'invalid', 'expired']) {
+    test(`GET users refuses ${mode} session before querying PostgreSQL`, async () => {
+        const h = harness();
+        let token = mode === 'missing' ? null : unknownToken;
+        if (mode === 'expired') {
+            token = (await frontendLogin(h)).successes[0].token;
+            h.advance(3600 * 1000 + 1);
+        }
+        const response = await h.load('api/users.js').default(protectedRequest(token));
+        assert.equal(response.status, 401);
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+        assert.equal(h.calls.list, 0);
+        h.assertSafeLogs([unknownToken]);
+    });
+}
+
+test('GET users returns an empty list and hides provider errors, including enumerable details', async () => {
+    for (const failed of [false, true]) {
+        const h = harness({userRows: [], ...(failed ? {sqlError: Object.assign(new Error('private-db'), {detail: 'private-detail'})} : {})});
+        const token = (await frontendLogin(h)).successes[0].token;
+        const response = await h.load('api/users.js').default(protectedRequest(token));
+        assert.equal(response.status, failed ? 500 : 200);
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+        const body = await response.json();
+        if (failed) {
+            assert.equal(body.code, 'USERS_UNAVAILABLE');
+            assert.equal(JSON.stringify(body).includes('private'), false);
+        } else assert.deepEqual(body, []);
+    }
+});
+
+test('users endpoint rejects unsupported methods without querying PostgreSQL', async () => {
+    const h = harness();
+    const response = await h.load('api/users.js').default(new Request('https://urc.invalid/api/users', {method: 'POST'}));
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get('allow'), 'GET');
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(h.calls.list, 0);
+});
+
+test('users service uses Bearer, no-store and signal, and strips unexpected fields', async () => {
+    let request;
+    const h = harness({fetch: async (url, init) => {
+        request = {url, ...init};
+        return Response.json(publicUsers.map(user => ({...user, token: 'private-response-token', password: 'private-hash'})));
+    }});
+    const controller = new AbortController();
+    const items = await h.load('src/features/users/usersApi.ts').getUsers(controller.signal);
+    assert.equal(request.url, '/api/users');
+    assert.equal(request.method, 'GET');
+    assert.equal(request.headers.Authorization === `Bearer ${h.storage.getItem('token')}`, true);
+    assert.equal(request.cache, 'no-store');
+    assert.equal(request.signal, controller.signal);
+    assert.equal(JSON.stringify(items), JSON.stringify(publicUsers));
+    h.assertSafeLogs(['private-response-token', 'private-hash']);
+});
+
+for (const [description, response, kind] of [
+    ['401', () => new Response('private-provider', {status: 401}), 'unauthorized'],
+    ['500', () => new Response('private-provider', {status: 500}), 'server'],
+    ['network', () => {throw new Error('private-network');}, 'network'],
+    ['JSON', () => new Response('invalid-json'), 'invalid'],
+    ['object instead of array', () => Response.json({users: publicUsers}), 'invalid'],
+    ['invalid ID', () => Response.json([{...publicUsers[0], user_id: '1'}]), 'invalid'],
+    ['unsafe ID', () => Response.json([{...publicUsers[0], user_id: Number.MAX_SAFE_INTEGER + 1}]), 'invalid'],
+    ['missing username', () => Response.json([{user_id: 1, last_login: null}]), 'invalid'],
+    ['missing last_login', () => Response.json([{user_id: 1, username: 'fixture'}]), 'invalid'],
+    ['duplicate ID', () => Response.json([publicUsers[0], publicUsers[0]]), 'invalid'],
+]) {
+    test(`users thunk rejects ${description} with a safe typed error`, async () => {
+        const app = usersApp({fetch: async () => response()});
+        const token = app.h.storage.getItem('token');
+        const result = await app.store.dispatch(app.fetchUsers());
+        assert.equal(app.fetchUsers.rejected.match(result), true);
+        assert.equal(result.payload.kind, kind);
+        assert.equal(JSON.stringify(result).includes('private-'), false);
+        if (kind === 'unauthorized') {
+            assertStorageCleared(app.h.storage);
+            assert.equal(app.store.getState().auth.status, 'anonymous');
+            assert.equal(app.store.getState().users.items.length, 0);
+            assert.equal(renderRoute(app.h, '/messages').includes('UBO Relay Chat'), false);
+        } else {
+            assert.equal(app.h.storage.getItem('token') === token, true);
+            assert.equal(app.store.getState().auth.status, 'authenticated');
+            assert.equal(app.store.getState().users.status, 'failed');
+            assert.match(renderRoute(app.h, '/messages'), /Réessayer/);
+        }
+        app.h.assertSafeLogs([token]);
+    });
+}
+
+test('users thunk pending then fulfilled updates the list and excludes the connected account', async () => {
+    const request = deferred();
+    const app = usersApp({fetch: () => request.promise});
+    const completion = app.store.dispatch(app.fetchUsers());
+    assert.equal(app.store.getState().users.status, 'loading');
+    assert.equal(typeof app.store.getState().users.requestId, 'string');
+    assert.match(renderRoute(app.h, '/messages'), /Chargement/);
+    request.resolve(Response.json(publicUsers));
+    const result = await completion;
+    assert.equal(app.fetchUsers.fulfilled.match(result), true);
+    const state = app.store.getState().users;
+    assert.equal(state.status, 'succeeded');
+    assert.equal(JSON.stringify(state.items), JSON.stringify(publicUsers));
+    assert.equal(state.error, null);
+    assert.equal(state.requestId, null);
+    const markup = renderRoute(app.h, '/messages');
+    assert.match(markup, /Connecté : fixture-user/);
+    assert.match(markup, /href="\/messages\/user\/2"/);
+    assert.equal(markup.includes('href="/messages/user/1"'), false);
+    assert.equal(markup.includes(app.h.storage.getItem('token')), false);
+    assert.equal(JSON.stringify(app.store.getState()).includes(app.h.storage.getItem('token')), false);
+});
+
+test('empty or current-account-only users list displays the empty state', async () => {
+    for (const items of [[], [publicUsers[0]]]) {
+        const app = usersApp({fetch: async () => Response.json(items)});
+        await app.store.dispatch(app.fetchUsers());
+        assert.match(renderRoute(app.h, '/messages'), /Aucun autre utilisateur disponible/);
+    }
+});
+
+test('users retry changes failed to loading then succeeded', async () => {
+    let calls = 0;
+    const app = usersApp({fetch: async () => ++calls === 1 ? new Response('', {status: 500}) : Response.json(publicUsers)});
+    await app.store.dispatch(app.fetchUsers());
+    assert.equal(app.store.getState().users.status, 'failed');
+    await app.store.dispatch(app.fetchUsers());
+    assert.equal(app.store.getState().users.status, 'succeeded');
+    assert.equal(app.store.getState().users.error, null);
+});
+
+test('latest users request wins even if an older response arrives later', async () => {
+    const requests = [deferred(), deferred()];
+    let index = 0;
+    const app = usersApp({fetch: () => requests[index++].promise});
+    const old = app.store.dispatch(app.fetchUsers());
+    const current = app.store.dispatch(app.fetchUsers());
+    requests[1].resolve(Response.json(publicUsers));
+    await current;
+    requests[0].resolve(Response.json([]));
+    await old;
+    assert.equal(JSON.stringify(app.store.getState().users.items), JSON.stringify(publicUsers));
+});
+
+test('an obsolete 401 cannot erase a newer successful request or its session', async () => {
+    const requests = [deferred(), deferred()];
+    let index = 0;
+    const app = usersApp({fetch: () => requests[index++].promise});
+    const token = app.h.storage.getItem('token');
+    const old = app.store.dispatch(app.fetchUsers());
+    const current = app.store.dispatch(app.fetchUsers());
+    requests[1].resolve(Response.json(publicUsers));
+    await current;
+    requests[0].resolve(new Response('', {status: 401}));
+    await old;
+    assert.equal(app.store.getState().auth.status, 'authenticated');
+    assert.equal(app.h.storage.getItem('token') === token, true);
+    assert.equal(app.store.getState().users.items.length, 2);
+});
+
+for (const actionName of ['resetAuth', 'setUser', 'startChecking', 'sessionUnavailable']) {
+    test(`auth ${actionName} clears users and ignores an in-flight response`, async () => {
+        const request = deferred();
+        let calls = 0;
+        const app = usersApp({fetch: async () => ++calls === 1 ? Response.json(publicUsers) : request.promise});
+        await app.store.dispatch(app.fetchUsers());
+        assert.equal(app.store.getState().users.items.length, 2);
+        const pending = app.store.dispatch(app.fetchUsers());
+        const user = {id: 9, username: 'new-account-fixture', externalId: 'new-public-id'};
+        app.store.dispatch(app.auth[actionName](actionName === 'setUser' ? user : undefined));
+        assert.equal(app.store.getState().users.items.length, 0);
+        request.resolve(Response.json(publicUsers));
+        await pending;
+        assert.equal(app.store.getState().users.items.length, 0);
+        assert.equal(app.store.getState().users.status, 'idle');
+    });
+}
+
+test('an old-session 401 cannot clear a newly stored token or a new Redux identity', async () => {
+    for (const changeIdentity of [false, true]) {
+        const request = deferred();
+        const app = usersApp({fetch: () => request.promise});
+        const pending = app.store.dispatch(app.fetchUsers());
+        app.h.storage.setItem('token', 'replacement-fixture-session');
+        if (changeIdentity) app.store.dispatch(app.auth.setUser({id: 9, username: 'next-fixture', externalId: 'next-public-id'}));
+        request.resolve(new Response('', {status: 401}));
+        await pending;
+        assert.equal(app.h.storage.getItem('token') === 'replacement-fixture-session', true);
+        assert.equal(app.store.getState().auth.status, 'authenticated');
+        assert.equal(app.store.getState().users.items.length, 0);
+    }
+});
+
+test('an aborted users request returns idle and cannot later restore its data', async () => {
+    const request = deferred();
+    const app = usersApp({fetch: () => request.promise});
+    const pending = app.store.dispatch(app.fetchUsers());
+    pending.abort();
+    const result = await pending;
+    assert.equal(result.meta.aborted, true);
+    assert.equal(app.store.getState().users.status, 'idle');
+    assert.equal(app.store.getState().users.error, null);
+    request.resolve(Response.json(publicUsers));
+    await flush();
+    assert.equal(app.store.getState().users.items.length, 0);
+});
+
+test('StrictMode effect setup, cleanup, setup leaves a live users request', async () => {
+    let store, effect;
+    const requests = [];
+    const h = harness({fetch: () => {const request = deferred(); requests.push(request); return request.promise;},
+        react: {useEffect: setup => {effect = setup;}},
+        reactRedux: {
+            useDispatch: () => store.dispatch, useStore: () => store,
+            useSelector: selector => selector(store.getState()),
+        },
+    });
+    store = h.load('src/app/store.ts').store;
+    store.dispatch(h.load('src/features/auth/authSlice.ts').setUser({id: 1, username: fixture.username, externalId: fixture.externalId}));
+    h.load('src/features/users/useUsers.ts').useUsers();
+    const cleanup = effect();
+    cleanup();
+    const cleanupCurrent = effect();
+    assert.equal(requests.length, 2);
+    requests[1].resolve(Response.json(publicUsers));
+    await flush();
+    requests[0].resolve(Response.json([]));
+    await flush();
+    assert.equal(store.getState().users.status, 'succeeded');
+    assert.equal(store.getState().users.items.length, 2);
+    cleanupCurrent();
+});
+
+for (const [id, expected] of [
+    ['2', 'Conversation avec recipient-fixture'], ['abc', 'Identifiant utilisateur invalide'],
+    ['0', 'Identifiant utilisateur invalide'], ['-1', 'Identifiant utilisateur invalide'],
+    ['1.2', 'Identifiant utilisateur invalide'], ['02', 'Identifiant utilisateur invalide'],
+    ['9007199254740992', 'Identifiant utilisateur invalide'],
+    ['999', 'Utilisateur introuvable'], ['1', 'votre propre compte'],
+]) {
+    test(`dynamic conversation route validates useParams ID ${id}`, async () => {
+        const app = usersApp({fetch: async () => Response.json(publicUsers)});
+        await app.store.dispatch(app.fetchUsers());
+        const markup = renderRoute(app.h, '/messages/user/' + id);
+        assert.equal(markup.includes(expected), true);
+        assert.match(markup, /href="\/messages"/);
+        assert.equal(markup.includes(app.h.storage.getItem('token')), false);
+    });
+}
+
+test('direct conversation access stays protected and loads recipient after session restoration', async () => {
+    const h = harness({fetch: async () => Response.json(publicUsers)});
+    assert.match(renderRoute(h, '/messages/user/2'), /Vérification de la session/);
+    const store = h.load('src/app/store.ts').store;
+    const auth = h.load('src/features/auth/authSlice.ts');
+    store.dispatch(auth.setUser({id: fixture.id, username: fixture.username, externalId: fixture.externalId}));
+    assert.match(renderRoute(h, '/messages/user/2'), /Chargement du destinataire/);
+    await store.dispatch(h.load('src/features/users/usersSlice.ts').fetchUsers());
+    assert.match(renderRoute(h, '/messages/user/2'), /Conversation avec recipient-fixture/);
+    store.dispatch(auth.resetAuth());
+    assert.equal(renderRoute(h, '/messages/user/2').includes('recipient-fixture'), false);
+});
+
+test('users data never enters Redux actions with credentials or response-only fields', async () => {
+    const h = harness({fetch: async () => Response.json(publicUsers.map(user => ({...user,
+        password: 'private-password-field', token: 'private-token-field', email: 'private-email-field'})))});
+    const actions = [];
+    const store = require('@reduxjs/toolkit').configureStore({
+        reducer: {auth: h.load('src/features/auth/authSlice.ts').default, users: h.load('src/features/users/usersSlice.ts').default},
+        middleware: getDefault => getDefault().concat(() => next => action => {actions.push(action); return next(action);}),
+    });
+    store.dispatch(h.load('src/features/auth/authSlice.ts').setUser({id: 1, username: fixture.username, externalId: fixture.externalId}));
+    await store.dispatch(h.load('src/features/users/usersSlice.ts').fetchUsers());
+    const serialized = JSON.stringify({actions, state: store.getState()});
+    for (const secret of [h.storage.getItem('token'), 'private-password-field', 'private-token-field', 'private-email-field']) {
+        assert.equal(serialized.includes(secret), false);
+    }
+    h.assertSafeLogs(['private-password-field', 'private-token-field', 'private-email-field']);
+});
+
+test('a current 401 clears a previously successful list and all authentication storage', async () => {
+    let calls = 0;
+    const app = usersApp({fetch: async () => ++calls === 1 ? Response.json(publicUsers) : new Response('', {status: 401})});
+    await app.store.dispatch(app.fetchUsers());
+    assert.equal(app.store.getState().users.items.length, 2);
+    const retry = app.store.dispatch(app.fetchUsers());
+    assert.equal(app.store.getState().users.items.length, 0);
+    await retry;
+    assert.equal(app.store.getState().auth.status, 'anonymous');
+    assert.equal(app.store.getState().users.status, 'idle');
+    assert.equal(app.store.getState().users.items.length, 0);
+    assertStorageCleared(app.h.storage);
+});
+
+test('a stored token alone cannot authorize the users thunk', async () => {
+    let calls = 0;
+    const h = harness({fetch: async () => {calls++; return Response.json(publicUsers);}});
+    const store = h.load('src/app/store.ts').store;
+    const {fetchUsers} = h.load('src/features/users/usersSlice.ts');
+    const result = await store.dispatch(fetchUsers());
+    assert.equal(result.meta.condition, true);
+    assert.equal(calls, 0);
+    assert.equal(store.getState().users.items.length, 0);
 });

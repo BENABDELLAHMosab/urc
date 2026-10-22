@@ -1,38 +1,26 @@
 import { sql } from "@vercel/postgres";
-import {checkSession, unauthorizedResponse} from "../lib/session";
+import {checkSession} from "../lib/session.js";
 
 export const config = {
     runtime: 'edge',
 };
 
 export default async function handler(request) {
+    const headers = {'content-type': 'application/json', 'cache-control': 'no-store'};
+    const json = (body, status = 200) => new Response(JSON.stringify(body), {status, headers});
+    if ((request.method ?? 'GET') !== 'GET') {
+        return new Response(JSON.stringify({code: 'METHOD_NOT_ALLOWED', message: 'GET required'}), {
+            status: 405, headers: {...headers, Allow: 'GET'},
+        });
+    }
     try {
-
         const connected = await checkSession(request);
         if (!connected) {
-            console.log("Not connected");
-            return unauthorizedResponse();
+            return json({code: 'UNAUTHORIZED', message: 'Session expired'}, 401);
         }
-
-        const {rowCount, rows} = await sql`select user_id, username, TO_CHAR(last_login, 'DD/MM/YYYY HH24:MI') as last_login from users order by last_login desc`;
-        console.log("Got " + rowCount + " users");
-        if (rowCount === 0) {
-            /* Vercel bug doesn't allow 204 response status */
-            return new Response("[]", {
-                status: 200,
-                headers: {'content-type': 'application/json'},
-            });
-        } else {
-            return new Response(JSON.stringify(rows), {
-                status: 200,
-                headers: {'content-type': 'application/json'},
-            });
-        }
-    } catch (error) {
-        console.error("User list request failed");
-        return new Response(JSON.stringify(error), {
-            status: 500,
-            headers: {'content-type': 'application/json'},
-        });
+        const {rows} = await sql`select user_id, username, TO_CHAR(last_login, 'DD/MM/YYYY HH24:MI') as last_login from users order by last_login desc`;
+        return json(rows.map(({user_id, username, last_login}) => ({user_id, username, last_login})));
+    } catch {
+        return json({code: 'USERS_UNAVAILABLE', message: 'Liste des utilisateurs indisponible.'}, 500);
     }
 };
