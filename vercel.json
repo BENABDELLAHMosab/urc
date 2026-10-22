@@ -1,5 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/login.js": {
+      "includeFiles": "node_modules/@vercel/postgres/dist/**"
+    },
+    "api/register.js": {
+      "includeFiles": "node_modules/@vercel/postgres/dist/**"
+    }
+  },
   "rewrites": [
     {
       "source": "/((?!api(?:/|$)|src(?:/|$)|assets(?:/|$)|node_modules(?:/|$)|@|.*\\.[^/]+$).*)",
