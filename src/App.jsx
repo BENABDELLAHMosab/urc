@@ -1,10 +1,18 @@
 import './App.css';
-import {Login} from "./user/Login";
+import {Navigate, Route, Routes} from "react-router-dom";
+import {LoginPage} from "./pages/LoginPage";
+import {MessagesPage} from "./pages/MessagesPage";
+import {NotFoundPage} from "./pages/NotFoundPage";
 
 function App() {
 
   return (
-      <Login/>
+      <Routes>
+          <Route path="/" element={<Navigate to="/login" replace />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/messages" element={<MessagesPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+      </Routes>
   );
 }
 

@@ -7,6 +7,9 @@ const vm = require('node:vm');
 const {createHash, webcrypto} = require('node:crypto');
 const {inspect} = require('node:util');
 const ts = require('typescript');
+const {createElement} = require('react');
+const {Provider} = require('react-redux');
+const {MemoryRouter, createRoutesFromElements, matchRoutes} = require('react-router-dom');
 const {renderToStaticMarkup} = require('react-dom/server');
 
 const root = path.resolve(__dirname, '..');
@@ -90,13 +93,16 @@ function harness(options = {}) {
         '@upstash/redis': {Redis: {fromEnv: () => redis}},
         '@vercel/postgres': {db, sql},
         '@pusher/push-notifications-server': FakeBeams,
+        '@reduxjs/toolkit': require('@reduxjs/toolkit'),
+        'react-redux': options.reactRedux || require('react-redux'),
+        'react-router-dom': options.reactRouter || require('react-router-dom'),
         react: options.react || require('react'),
         'react/jsx-runtime': require('react/jsx-runtime'),
     };
     function load(relativePath) {
         let filename = path.resolve(root, relativePath);
         if (!path.extname(filename)) {
-            filename = ['.js', '.ts', '.tsx'].map(ext => filename + ext)
+            filename = ['.js', '.jsx', '.ts', '.tsx'].map(ext => filename + ext)
                 .find(candidate => fs.existsSync(candidate));
         }
         if (!filename || !filename.startsWith(root + path.sep)) {
@@ -114,12 +120,14 @@ function harness(options = {}) {
             module, exports: module.exports,
             require(name) {
                 if (Object.hasOwn(dependencies, name)) return dependencies[name];
+                if (name.endsWith('.css')) return {};
                 if (name.startsWith('.')) {
                     return load(path.relative(root, path.resolve(path.dirname(filename), name)));
                 }
                 throw new Error('Unmocked dependency');
             },
             Headers, Request, Response, Error, crypto: webcrypto, btoa,
+            FormData: options.FormData || FormData,
             process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
                 (...args) => logs.push(args)])),
@@ -368,14 +376,216 @@ test('storage cleanup continues and reports failure even when one removal is den
 });
 
 test('successful Login markup hides the token and uses a password input', () => {
-    let hook = 0;
-    const states = [{}, {token: unknownToken, username: fixture.username, externalId: fixture.externalId}];
-    const h = harness({react: {useState: () => [states[hook++], () => {}]}});
-    const element = h.load('src/user/Login.tsx').Login();
-    const markup = renderToStaticMarkup(element);
+    const h = harness();
+    const {store} = h.load('src/app/store.ts');
+    const {setUser} = h.load('src/features/auth/authSlice.ts');
+    store.dispatch(setUser({id: fixture.id, username: fixture.username, externalId: fixture.externalId}));
+    h.storage.setItem('token', unknownToken);
+    const markup = renderToStaticMarkup(createElement(Provider, {store},
+        createElement(MemoryRouter, null, createElement(h.load('src/user/Login.tsx').Login))));
     assert.match(markup, /type="password"/);
     assert.match(markup, /Connecté/);
     assert.equal(markup.includes(fixture.username), true);
     assert.equal(markup.includes(unknownToken), false, 'Session token must not be rendered');
     h.assertSafeLogs([unknownToken]);
+});
+
+test('auth reducer starts anonymous and ignores unrelated actions', () => {
+    const reducer = harness().load('src/features/auth/authSlice.ts').default;
+    const state = reducer(undefined, {type: 'unrelated'});
+    assert.equal(state.user, null);
+    assert.equal(state.status, 'anonymous');
+    assert.deepEqual(Object.keys(state).sort(), ['status', 'user']);
+});
+
+test('setUser synchronously records a public identity without changing the previous state', () => {
+    const {default: reducer, setUser} = harness().load('src/features/auth/authSlice.ts');
+    const previous = reducer(undefined, {type: 'init'});
+    const user = {id: fixture.id, username: fixture.username, externalId: fixture.externalId};
+    const action = setUser(user);
+    const next = reducer(previous, action);
+    assert.equal(action.type, 'auth/setUser');
+    assert.equal(next.status, 'authenticated');
+    assert.deepEqual(JSON.parse(JSON.stringify(next.user)), user);
+    assert.equal(previous.user, null);
+    assert.equal(previous.status, 'anonymous');
+});
+
+test('resetAuth removes the public identity without changing sessionStorage', () => {
+    const h = harness();
+    const {store} = h.load('src/app/store.ts');
+    const {setUser, resetAuth} = h.load('src/features/auth/authSlice.ts');
+    store.dispatch(setUser({id: fixture.id, username: fixture.username, externalId: fixture.externalId}));
+    store.dispatch(resetAuth());
+    assert.equal(store.getState().auth.user, null);
+    assert.equal(store.getState().auth.status, 'anonymous');
+    assert.equal(h.storage.values.has('token'), true);
+});
+
+function connectedForm() {
+    let store;
+    let error = {};
+    let resets = 0;
+    const actions = [];
+    const navigations = [];
+    const h = harness({
+        react: {useState: () => [error, value => { error = value; }]},
+        reactRedux: {
+            useDispatch: () => action => { actions.push(action); return store.dispatch(action); },
+            useSelector: selector => selector(store.getState()),
+        },
+        reactRouter: {
+            useNavigate: () => (to, options) => {
+                navigations.push({to, options, user: store.getState().auth.user});
+            },
+        },
+        FormData: class {
+            constructor(form) { this.fields = form.fields; }
+            get(key) { return this.fields[key]; }
+        },
+    });
+    store = h.load('src/app/store.ts').store;
+    return {
+        h, store, actions, navigations,
+        get error() { return error; },
+        get resets() { return resets; },
+        async submit(password = fixture.password) {
+            const element = h.load('src/user/Login.tsx').Login();
+            const form = element.props.children[0];
+            let prevented = false;
+            await form.props.onSubmit({
+                preventDefault() { prevented = true; },
+                currentTarget: {
+                    fields: {login: fixture.username, password},
+                    reset() { resets++; },
+                },
+            });
+            assert.equal(prevented, true);
+        },
+    };
+}
+
+test('Login success dispatches public fields only while loginApi retains the token', async () => {
+    const form = connectedForm();
+    await form.submit();
+    assert.equal(form.store.getState().auth.status, 'authenticated');
+    assert.equal(form.store.getState().auth.user.id, fixture.id);
+    assert.equal(form.actions.length, 1);
+    assert.deepEqual(Object.keys(form.actions[0].payload).sort(), ['externalId', 'id', 'username']);
+    const token = form.h.storage.values.get('token');
+    assert.equal(form.h.sessions.has(token), true);
+    const reduxData = JSON.stringify({actions: form.actions, state: form.store.getState()});
+    assert.equal(reduxData.includes(token), false, 'Token must stay outside Redux');
+    assert.equal(reduxData.includes(fixture.password), false, 'Password must stay outside Redux');
+    assert.equal(form.resets, 1);
+    assert.equal(form.error.message, '');
+    assert.equal(form.navigations.length, 1);
+    assert.equal(form.navigations[0].to, '/messages');
+    assert.equal(form.navigations[0].options.replace, true);
+    assert.equal(form.navigations[0].user.id, fixture.id);
+    form.h.assertSafeLogs();
+});
+
+test('failed Login clears Redux and stored authentication while preserving the error', async () => {
+    const form = connectedForm();
+    await form.submit();
+    await form.submit('wrong-fixture-password');
+    assert.equal(form.store.getState().auth.status, 'anonymous');
+    assert.equal(form.store.getState().auth.user, null);
+    assert.equal(form.actions.length, 2);
+    assert.equal(form.actions[1].type, 'auth/resetAuth');
+    assert.equal(form.error.httpStatus, 401);
+    assert.equal(form.error.code, 'UNAUTHORIZED');
+    assert.equal(form.resets, 1);
+    assert.equal(form.navigations.length, 1, 'A refused login must not trigger another navigation');
+    assertStorageCleared(form.h.storage);
+    form.h.assertSafeLogs();
+});
+
+test('a fresh Redux store does not restore a user from sessionStorage', () => {
+    const h = harness();
+    const {store} = h.load('src/app/store.ts');
+    const markup = renderToStaticMarkup(createElement(Provider, {store},
+        createElement(MemoryRouter, null, createElement(h.load('src/user/Login.tsx').Login))));
+    assert.equal(store.getState().auth.user, null);
+    assert.equal(store.getState().auth.status, 'anonymous');
+    assert.equal(h.storage.values.has('token'), true);
+    assert.equal(markup.includes('Connecté'), false);
+});
+
+function renderRoute(h, pathname) {
+    const {store} = h.load('src/app/store.ts');
+    return renderToStaticMarkup(createElement(Provider, {store},
+        createElement(MemoryRouter, {initialEntries: [pathname]},
+            createElement(h.load('src/App.jsx').default))));
+}
+
+test('root route requests a replacement navigation to /login', () => {
+    const app = harness().load('src/App.jsx').default();
+    const routes = createRoutesFromElements(app.props.children);
+    const rootMatch = matchRoutes(routes, '/').at(-1).route;
+    assert.equal(rootMatch.element.type, require('react-router-dom').Navigate);
+    assert.equal(rootMatch.element.props.to, '/login');
+    assert.equal(rootMatch.element.props.replace, true);
+});
+
+test('/login renders the existing form', () => {
+    const markup = renderRoute(harness(), '/login');
+    assert.match(markup, /<form/);
+    assert.match(markup, /name="login"/);
+    assert.match(markup, /type="password"/);
+});
+
+test('/messages is accessible anonymously without a status-based redirect', () => {
+    const h = harness();
+    const markup = renderRoute(h, '/messages');
+    assert.match(markup, /UBO Relay Chat/);
+    assert.match(markup, /La messagerie sera développée prochainement/);
+    assert.equal(markup.includes('Connecté'), false);
+    assert.equal(h.load('src/app/store.ts').store.getState().auth.status, 'anonymous');
+});
+
+test('/messages reads the public username from the existing Redux store', () => {
+    const h = harness();
+    const {store} = h.load('src/app/store.ts');
+    store.dispatch(h.load('src/features/auth/authSlice.ts').setUser({
+        id: fixture.id, username: fixture.username, externalId: fixture.externalId,
+    }));
+    h.storage.setItem('token', unknownToken);
+    const markup = renderRoute(h, '/messages');
+    assert.equal(markup.includes(fixture.username), true);
+    assert.equal(markup.includes(unknownToken), false);
+    h.assertSafeLogs([unknownToken]);
+});
+
+test('an unknown path renders 404 with a login link', () => {
+    const markup = renderRoute(harness(), '/unknown/path');
+    assert.match(markup, /404/);
+    assert.match(markup, /href="\/login"/);
+});
+
+test('a refused login never navigates away from the form', async () => {
+    const form = connectedForm();
+    await form.submit('wrong-fixture-password');
+    assert.equal(form.navigations.length, 0);
+    assert.equal(form.error.httpStatus, 401);
+    assert.equal(form.store.getState().auth.status, 'anonymous');
+});
+
+test('Vercel SPA fallback excludes API endpoints, Vite modules and static files', () => {
+    const {pathToRegexp} = require('path-to-regexp');
+    const config = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8'));
+    assert.equal(config.rewrites.length, 1);
+    const rule = config.rewrites[0];
+    assert.equal(rule.destination, '/index.html');
+    const pattern = pathToRegexp(rule.source);
+    for (const pathname of ['/', '/login', '/messages', '/unknown/path']) {
+        assert.equal(pattern.test(pathname), true);
+    }
+    for (const pathname of ['/api', '/api/login', '/api/users', '/api/message', '/api/beams',
+        '/src/index.jsx', '/src/App', '/@vite/client', '/@react-refresh', '/@id/module',
+        '/@fs/tmp/module.js', '/node_modules/.vite/deps/react.js', '/assets/index.js',
+        '/index.html', '/favicon.ico', '/service-worker.js', '/manifest.json']) {
+        assert.equal(pattern.test(pathname), false);
+    }
 });

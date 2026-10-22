@@ -6,6 +6,7 @@
     "@babel/plugin-proposal-private-property-in-object": "^7.21.11",
     "@pusher/push-notifications-server": "^1.2.7",
     "@pusher/push-notifications-web": "^1.1.0",
+    "@reduxjs/toolkit": "^2.13.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
@@ -17,6 +18,7 @@
     "pusher-js": "^8.6.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "react-redux": "^9.3.0",
     "react-router-dom": "^7.18.4",
     "vercel": "^48.4.1",
     "web-vitals": "^6.2.2"

@@ -10,7 +10,7 @@ function clearStoredSession() {
         }
     }
 }
-
+// fetch srp
 export async function loginUser(user: User, onResult: SessionCallback, onError: ErrorCallback) {
     try {
         const response = await fetch("/api/login", {
