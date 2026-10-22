@@ -41,7 +41,10 @@ function harness(options = {}) {
     let now = 0;
     const logs = [];
     const sessions = new Map();
-    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0};
+    const calls = {get: 0, set: 0, hset: 0, list: 0, update: 0, beams: 0, insert: 0, release: 0};
+    const users = new Map([[fixture.username, {user_id: fixture.id, username: fixture.username,
+        email: fixture.email, external_id: fixture.externalId,
+        password: createHash('sha256').update(fixture.username + fixture.password).digest('base64')}]]);
     const storage = options.storage || memoryStorage();
     const sensitive = [fixture.password, fixture.email, 'fixture-beams-token'];
     const redis = {
@@ -58,7 +61,25 @@ function harness(options = {}) {
         },
         async hset() { calls.hset++; },
     };
-    const sql = async () => {
+    const sql = async (parts, ...values) => {
+        if (options.sqlError) throw options.sqlError;
+        const query = parts.join('?').trim().toLowerCase();
+        if (query.startsWith('select user_id from users where')) {
+            const rows = [...users.values()].filter(row => row.username === values[0] || row.email === values[1]);
+            return {rowCount: rows.length, rows};
+        }
+        if (query.startsWith('insert into users')) {
+            calls.insert++;
+            if (options.insertError) throw options.insertError;
+            if ([...users.values()].some(row => row.username === values[0] || row.email === values[2])) {
+                throw Object.assign(new Error('Unique violation'), {code: '23505'});
+            }
+            const row = {user_id: users.size + 1, username: values[0], password: values[1],
+                email: values[2], created_on: new Date().toISOString(), external_id: values[3]};
+            users.set(row.username, row);
+            sensitive.push(row.password);
+            return {rowCount: 1, rows: [{user_id: row.user_id, username: row.username}]};
+        }
         calls.list++;
         return {rowCount: 1, rows: [{user_id: fixture.id, username: fixture.username, last_login: null}]};
     };
@@ -66,16 +87,11 @@ function harness(options = {}) {
         async connect() {
             if (options.dbError) throw options.dbError;
             return {
+                release() { calls.release++; },
                 async sql(parts, ...values) {
                     if (parts.join('?').startsWith('select')) {
-                        const expectedHash = createHash('sha256')
-                            .update(fixture.username + fixture.password).digest('base64');
-                        const valid = values[0] === fixture.username && values[1] === expectedHash;
-                        return {
-                            rowCount: valid ? 1 : 0,
-                            rows: valid ? [{user_id: fixture.id, username: fixture.username,
-                                email: fixture.email, external_id: fixture.externalId}] : [],
-                        };
+                        const row = users.get(values[0]);
+                        return {rowCount: row ? 1 : 0, rows: row ? [row] : []};
                     }
                     calls.update++;
                     return {rowCount: 1};
@@ -96,7 +112,10 @@ function harness(options = {}) {
         '@pusher/push-notifications-server': FakeBeams,
         '@reduxjs/toolkit': require('@reduxjs/toolkit'),
         'react-redux': options.reactRedux || require('react-redux'),
-        'react-router-dom': options.reactRouter || require('react-router-dom'),
+        'react-router-dom': {...require('react-router-dom'), ...options.reactRouter, useLocation: options.reactRouter ? () => ({state: null}) : require('react-router-dom').useLocation},
+        '@node-rs/argon2': require('@node-rs/argon2'),
+        'validator/lib/isEmail.js': require('validator/lib/isEmail.js'),
+        'node:crypto': require('node:crypto'),
         react: options.react || require('react'),
         'react/jsx-runtime': require('react/jsx-runtime'),
     };
@@ -127,22 +146,22 @@ function harness(options = {}) {
                 }
                 throw new Error('Unmocked dependency');
             },
-            Headers, Request, Response, Error, AbortController, DOMException, crypto: webcrypto, btoa,
+            Headers, Request, Response, Error, AbortController, DOMException, Buffer, crypto: webcrypto, btoa,
             FormData: options.FormData || FormData,
             process: {env: {PUSHER_INSTANCE_ID: 'fixture-instance', PUSHER_SECRET_KEY: 'fixture-key'}},
             console: Object.fromEntries(['log', 'error', 'warn'].map(method => [method,
                 (...args) => logs.push(args)])),
             sessionStorage: storage,
             fetch: options.fetch || (async (url, init) => {
-                assert.equal(['/api/login', '/api/me'].includes(url), true);
-                return load(url === '/api/me' ? 'api/me.js' : 'api/login.js')
-                    .default(new Request('https://urc.invalid' + url, init));
+                assert.equal(['/api/login', '/api/me', '/api/register'].includes(url), true);
+                const module = load(url.slice(1) + '.js');
+                return (url === '/api/me' ? module.default : module.default.fetch)(new Request('https://urc.invalid' + url, init));
             }),
         }, {filename});
         return module.exports;
     }
     return {
-        load, storage, sessions, calls,
+        load, storage, sessions, calls, users,
         advance(milliseconds) { now += milliseconds; },
         assertSafeLogs(extra = []) {
             const output = inspect(logs);
@@ -190,7 +209,7 @@ async function frontendLogin(h, password = fixture.password) {
 
 test('valid login keeps the hash contract, Redis TTL and protected access', async () => {
     const h = harness();
-    const response = await h.load('api/login.js').default(loginRequest());
+    const response = await h.load('api/login.js').default.fetch(loginRequest());
     assert.equal(response.status, 200);
     const session = await response.json();
     assert.equal(typeof session.token, 'string');
@@ -205,7 +224,7 @@ test('valid login keeps the hash contract, Redis TTL and protected access', asyn
 
 test('invalid credentials return 401 without creating a session', async () => {
     const h = harness();
-    const response = await h.load('api/login.js').default(loginRequest('wrong-fixture-password'));
+    const response = await h.load('api/login.js').default.fetch(loginRequest('wrong-fixture-password'));
     assert.equal(response.status, 401);
     assert.equal((await response.json()).code, 'UNAUTHORIZED');
     assert.equal(h.calls.set, 0);
@@ -215,7 +234,7 @@ test('invalid credentials return 401 without creating a session', async () => {
 
 test('expired session returns 401 rather than 500', async () => {
     const h = harness();
-    const login = await h.load('api/login.js').default(loginRequest());
+    const login = await h.load('api/login.js').default.fetch(loginRequest());
     const session = await login.json();
     h.advance(3600001);
     const response = await h.load('api/users.js').default(protectedRequest(session.token));
@@ -267,7 +286,7 @@ test('message stops after its single JSON 401 without reading the body', async (
 
 test('Beams still authenticates its user without logging either token or profile', async () => {
     const h = harness();
-    const login = await h.load('api/login.js').default(loginRequest());
+    const login = await h.load('api/login.js').default.fetch(loginRequest());
     const session = await login.json();
     const response = nodeResponse();
     await h.load('api/beams.js').default({...protectedRequest(session.token),
@@ -289,7 +308,7 @@ test('Beams still authenticates its user without logging either token or profile
 test('infrastructure errors stay server errors and do not log raw details', async () => {
     const detail = 'sensitive-fixture-provider-detail';
     const db = harness({dbError: new Error(detail)});
-    assert.equal((await db.load('api/login.js').default(loginRequest())).status, 500);
+    assert.equal((await db.load('api/login.js').default.fetch(loginRequest())).status, 500);
     db.assertSafeLogs([detail]);
     const redis = harness({redisError: new Error(detail)});
     assert.equal((await redis.load('api/users.js').default(protectedRequest(unknownToken))).status, 500);
@@ -602,7 +621,7 @@ const publicUser = {id: fixture.id, username: fixture.username, externalId: fixt
 
 test('/api/me returns only public data without extending the session', async () => {
     const h = harness();
-    const login = await h.load('api/login.js').default(loginRequest());
+    const login = await h.load('api/login.js').default.fetch(loginRequest());
     const {token} = await login.json();
     const expiresAt = h.sessions.get(token).expiresAt;
     const response = await h.load('api/me.js').default(meRequest(token));
@@ -617,7 +636,7 @@ test('/api/me returns only public data without extending the session', async () 
 
 test('/api/me returns uncached JSON 401 for missing, malformed, unknown and expired sessions', async () => {
     const h = harness();
-    const login = await h.load('api/login.js').default(loginRequest());
+    const login = await h.load('api/login.js').default.fetch(loginRequest());
     const {token} = await login.json();
     h.advance(3600001);
     for (const candidate of [undefined, 'malformed', unknownToken, token]) {
@@ -775,7 +794,7 @@ test('an old verification cannot overwrite or clear a newer successful login', a
         const oldRequest = deferred();
         let app;
         app = startup({fetch: (url, init) => url === '/api/me' ? oldRequest.promise
-            : app.h.load('api/login.js').default(new Request('https://urc.invalid/api/login', init))});
+            : app.h.load('api/login.js').default.fetch(new Request('https://urc.invalid/api/login', init))});
         const cleanup = app.run();
         const result = await frontendLogin(app.h);
         const session = result.successes[0];
@@ -791,4 +810,363 @@ test('an old verification cannot overwrite or clear a newer successful login', a
         app.h.assertSafeLogs();
         cleanup();
     }
+});
+
+const registration = {username: 'new-fixture-user', email: 'new-fixture@example.invalid',
+    password: 'new-synthetic-password'};
+function registerRequest(data = registration) {
+    return new Request('https://urc.invalid/api/register', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data),
+    });
+}
+
+test('registration inserts an Argon2id account and returns only the public result', async () => {
+    const h = harness();
+    const response = await h.load('api/register.js').default.fetch(registerRequest());
+    assert.equal(response.status, 201);
+    const result = await response.json();
+    assert.deepEqual(Object.keys(result).sort(), ['id', 'username']);
+    assert.equal(result.username, registration.username);
+    const row = h.users.get(registration.username);
+    const parameters = require('@node-rs/argon2').parseOptions(row.password);
+    assert.equal(parameters.algorithm, require('@node-rs/argon2').Algorithm.Argon2id);
+    assert.equal(parameters.memoryCost, 19456);
+    assert.equal(parameters.timeCost, 2);
+    assert.equal(parameters.parallelism, 1);
+    assert.equal(parameters.saltLen, 16);
+    assert.equal(row.password.length, 97);
+    assert.equal(row.password !== registration.password, true);
+    assert.equal(typeof row.created_on, 'string');
+    assert.match(row.external_id, /^[0-9a-f-]{36}$/);
+    assert.equal(h.calls.set, 0, 'Registration must not create a Redis session');
+    assert.equal(h.calls.hset, 0);
+    assert.equal(JSON.stringify(result).includes(row.password), false);
+    assert.equal(JSON.stringify(result).includes(registration.password), false);
+    h.assertSafeLogs([registration.password]);
+});
+
+test('registration refuses missing fields, malformed input and lengths outside the policy', async () => {
+    const h = harness();
+    const invalid = [null, [], {}, {...registration, password: undefined}, {...registration, email: ''},
+        {...registration, email: 'invalid-email'}, {...registration, email: 'a'.repeat(250) + '@mail.invalid'},
+        {...registration, username: 'a'.repeat(51)}, {...registration, username: 'ab'},
+        {...registration, username: "invalid'username"}, {...registration, password: 'short'},
+        {...registration, password: 'a'.repeat(129)}, {...registration, password: 123}];
+    for (const data of invalid) {
+        const response = await h.load('api/register.js').default.fetch(registerRequest(data));
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).code, 'INVALID_INPUT');
+    }
+    assert.equal(h.calls.insert, 0);
+});
+
+test('registration refuses an existing username or an existing email', async () => {
+    const h = harness();
+    for (const data of [{...registration, username: fixture.username}, {...registration, email: fixture.email}]) {
+        const response = await h.load('api/register.js').default.fetch(registerRequest(data));
+        assert.equal(response.status, 409);
+        assert.equal((await response.json()).code, 'CONFLICT');
+    }
+    assert.equal(h.calls.insert, 0);
+});
+
+for (const length of [11, 12, 128, 129]) {
+    test(`shared and backend password length policy: ${length} characters`, async () => {
+        const data = {...registration, password: 'a'.repeat(length)};
+        const valid = length >= 12 && length <= 128;
+        const h = harness(valid ? {} : {sqlError: new Error('SQL must not be reached')});
+        const validation = h.load('lib/registration.js').validateRegistration(data);
+        assert.equal(Boolean(validation.data), valid);
+        if (!valid) assert.match(validation.fieldErrors.password, /12 et 128/);
+        const response = await h.load('api/register.js').default.fetch(registerRequest(data));
+        assert.equal(response.status, valid ? 201 : 400);
+        assert.equal(h.calls.insert, valid ? 1 : 0);
+        if (length === 12) {
+            const login = await h.load('api/login.js').default.fetch(new Request('https://urc.invalid/api/login', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username: data.username, password: data.password}),
+            }));
+            assert.equal(login.status, 200, 'The twelve-character account must remain usable');
+            h.assertSafeLogs([data.password]);
+        }
+    });
+}
+
+for (const [description, email, valid] of [
+    ['missing local part', '@gmail.com', false],
+    ['missing domain', 'toto@', false],
+    ['missing separator', 'totogmail.com', false],
+    ['two separators', 'toto@@gmail.com', false],
+    ['empty domain label', 'toto@gmail..com', false],
+    ['space in local part', 'to to@gmail.com', false],
+    ['space in domain', 'toto@g mail.com', false],
+    ['invalid domain label', 'toto@-gmail.com', false],
+    ['display name', 'Toto <toto@gmail.com>', false],
+    ['overlong address', 'a'.repeat(250) + '@mail.invalid', false],
+    ['ordinary address', 'toto@gmail.com', true],
+    ['university address', 'prenom.nom@univ-brest.fr', true],
+    ['unverified TLD', 'toto@gogo.como', true],
+]) {
+    test(`shared and backend email syntax: ${description}`, async () => {
+        const h = harness(valid ? {} : {sqlError: new Error('SQL must not be reached')});
+        const data = {...registration, email};
+        const validation = h.load('lib/registration.js').validateRegistration(data);
+        assert.equal(Boolean(validation.data), valid);
+        if (!valid) assert.equal(typeof validation.fieldErrors.email, 'string');
+        const response = await h.load('api/register.js').default.fetch(registerRequest(data));
+        assert.equal(response.status, valid ? 201 : 400);
+        assert.equal(h.calls.insert, valid ? 1 : 0);
+        assert.equal(h.users.size, valid ? 2 : 1);
+    });
+}
+
+test('email trimming is identical for validation, duplicate lookup and storage', async () => {
+    const h = harness();
+    const email = 'Prenom.Nom@univ-brest.fr';
+    const data = {...registration, email: `  ${email}  `};
+    assert.equal(h.load('lib/registration.js').validateRegistration(data).data.email, email);
+    assert.equal((await h.load('api/register.js').default.fetch(registerRequest(data))).status, 201);
+    assert.equal(h.users.get(registration.username).email, email);
+    const duplicate = {...data, username: 'another-fixture-user', email};
+    assert.equal((await h.load('api/register.js').default.fetch(registerRequest(duplicate))).status, 409);
+    assert.equal(h.calls.insert, 1);
+});
+
+test('registration maps PostgreSQL unique violations during insertion to HTTP 409', async () => {
+    const h = harness({insertError: Object.assign(new Error('sensitive-constraint-detail'), {code: '23505'})});
+    const response = await h.load('api/register.js').default.fetch(registerRequest());
+    assert.equal(response.status, 409);
+    assert.equal((await response.text()).includes('sensitive-constraint-detail'), false);
+    assert.equal(h.users.has(registration.username), false);
+});
+
+test('simultaneous registrations cannot both create the same identity', async () => {
+    const h = harness();
+    const responses = await Promise.all([1, 2].map(() => h.load('api/register.js').default.fetch(registerRequest())));
+    assert.deepEqual(responses.map(response => response.status).sort(), [201, 409]);
+    assert.equal([...h.users.values()].filter(row => row.username === registration.username).length, 1);
+});
+
+test('registration rejects invalid JSON and unsupported methods without inserting', async () => {
+    const h = harness();
+    const api = h.load('api/register.js').default.fetch;
+    const malformed = await api(new Request('https://urc.invalid/api/register', {
+        method: 'POST', body: '{', headers: {'Content-Type': 'application/json'},
+    }));
+    assert.equal(malformed.status, 400);
+    for (const method of ['GET', 'PUT', 'DELETE', 'OPTIONS']) {
+        const response = await api(new Request('https://urc.invalid/api/register', {method}));
+        assert.equal(response.status, 405);
+        assert.equal(response.headers.get('allow'), 'POST');
+    }
+    assert.equal(h.calls.insert, 0);
+});
+
+test('registration hides PostgreSQL details on both read and insert failures', async () => {
+    for (const failure of ['sqlError', 'insertError']) {
+        const h = harness({[failure]: new Error('sensitive-postgres-detail')});
+        const response = await h.load('api/register.js').default.fetch(registerRequest());
+        assert.equal(response.status, 500);
+        const body = await response.text();
+        assert.equal(body.includes('sensitive-postgres-detail'), false);
+        assert.equal(body.includes(registration.password), false);
+        h.assertSafeLogs(['sensitive-postgres-detail', registration.password]);
+    }
+});
+
+test('a newly registered account can log in and use /api/me', async () => {
+    const h = harness();
+    assert.equal((await h.load('api/register.js').default.fetch(registerRequest())).status, 201);
+    const login = await h.load('api/login.js').default.fetch(new Request('https://urc.invalid/api/login', {
+        method: 'POST', body: JSON.stringify({username: registration.username, password: registration.password}),
+        headers: {'Content-Type': 'application/json'},
+    }));
+    assert.equal(login.status, 200);
+    const session = await login.json();
+    const me = await h.load('api/me.js').default(meRequest(session.token));
+    assert.equal(me.status, 200);
+    assert.equal((await me.json()).username, registration.username);
+    assert.equal(h.calls.release, 1);
+    h.assertSafeLogs([registration.password]);
+});
+
+test('the historical seeded account still authenticates with its existing SQL fingerprint', async () => {
+    const h = harness();
+    const sql = fs.readFileSync(path.join(root, 'scripts/db.sql'), 'utf8');
+    const match = sql.match(/values\s*\('test',\s*'([^']+)'/i);
+    assert.equal(Boolean(match), true, 'Historical seed must be identifiable');
+    h.users.set('test', {user_id: 999, username: 'test', email: 'historic@example.invalid',
+        external_id: 'historic-fixture-id', password: match[1]});
+    const response = await h.load('api/login.js').default.fetch(new Request('https://urc.invalid/api/login', {
+        method: 'POST', body: JSON.stringify({username: 'test', password: 'testubo'}),
+        headers: {'Content-Type': 'application/json'},
+    }));
+    assert.equal(response.status, 200);
+    assert.equal(h.users.get('test').password === match[1], true, 'No silent hash migration');
+    h.assertSafeLogs([match[1]]);
+});
+
+test('Argon2id uses independent salts, preserves Unicode and rejects the wrong password', async () => {
+    const passwords = harness().load('lib/password.js');
+    const password = 'synthetic-é🙂-password';
+    const first = await passwords.hashPassword(password);
+    const second = await passwords.hashPassword(password);
+    assert.equal(first !== second, true);
+    assert.equal(await passwords.verifyPassword('any-user', password, first), true);
+    assert.equal(await passwords.verifyPassword('any-user', password + 'x', first), false);
+    assert.equal(await passwords.verifyPassword('any-user', password, '$argon2id$invalid'), false);
+});
+
+test('registration frontend sends POST, strips unexpected response fields and leaves storage unchanged', async () => {
+    const h = harness();
+    const before = JSON.stringify([...h.storage.values]);
+    const result = await h.load('src/user/registerApi.ts').registerUser(registration);
+    assert.equal(result.username, registration.username);
+    assert.deepEqual(Object.keys(result).sort(), ['id', 'username']);
+    assert.equal(JSON.stringify([...h.storage.values]), before);
+    assert.equal(h.calls.set, 0);
+});
+
+test('registration frontend handles HTTP, network and JSON failures without leaking details', async () => {
+    for (const fetch of [
+        async () => new Response('private-postgres-detail', {status: 400}),
+        async () => new Response('private-postgres-detail', {status: 409}),
+        async () => new Response('private-postgres-detail', {status: 500}),
+        async () => {throw new Error('private-network-detail');},
+        async () => new Response('not-json', {status: 201}),
+        async () => Response.json({password: 'must-not-escape'}, {status: 201}),
+    ]) {
+        const h = harness({fetch});
+        await assert.rejects(h.load('src/user/registerApi.ts').registerUser(registration),
+            error => !error.message.includes('private-') && !error.message.includes('must-not-escape'));
+    }
+});
+
+test('/register renders a public, labelled and controlled form', () => {
+    const markup = renderRoute(harness(), '/register');
+    assert.match(markup, /Inscription/);
+    assert.match(markup, /type="email"/);
+    assert.match(markup, /type="password"/);
+    assert.match(markup, /minLength="12"/i);
+    assert.match(markup, /maxLength="50"/i);
+    assert.match(markup, /href="\/login"/);
+});
+
+function registrationForm(options = {}) {
+    const state = ['', '', '', '', false, {}];
+    let cursor = 0;
+    const navigations = [];
+    const h = harness({...options,
+        react: {useState: () => {
+            const index = cursor++;
+            return [state[index], value => {state[index] = value;}];
+        }},
+        reactRouter: {useNavigate: () => (to, options) => navigations.push({to, options})},
+    });
+    const render = () => {
+        cursor = 0;
+        return h.load('src/pages/RegisterPage.tsx').RegisterPage();
+    };
+    return {h, state, navigations, render,
+        fill(data) {
+            const form = render().props.children[1];
+            for (const input of form.props.children.filter(child => child?.type === 'input')) {
+                input.props.onChange({target: {value: data[input.props.name]}});
+            }
+        },
+        submit() {return render().props.children[1].props.onSubmit({preventDefault() {}});},
+    };
+}
+
+test('controlled registration fields validate locally before sending any request', async () => {
+    let calls = 0;
+    const form = registrationForm({fetch: async () => {calls++; throw new Error('Unexpected request');}});
+    form.fill({...registration, password: 'short'});
+    assert.equal(form.state[0], registration.username);
+    await form.submit();
+    assert.equal(calls, 0);
+    assert.match(form.state[5].password, /12 et 128/);
+    assert.equal(form.state[4], false);
+    assert.equal(form.navigations.length, 0);
+});
+
+test('registration form displays pending, disables submit, and navigates after success without logging in', async () => {
+    const request = deferred();
+    const form = registrationForm({fetch: () => request.promise});
+    const snapshot = JSON.stringify([...form.h.storage.values]);
+    form.fill(registration);
+    const completion = form.submit();
+    assert.equal(form.state[4], true);
+    const markup = form.render();
+    const button = markup.props.children[1].props.children.find(child => child?.type === 'button');
+    assert.equal(button.props.disabled, true);
+    assert.equal(markup.props.children[2].props.role, 'status');
+    assert.equal(form.navigations.length, 0);
+    request.resolve(Response.json({id: 42, username: registration.username}, {status: 201}));
+    await completion;
+    assert.equal(form.state[4], false);
+    assert.equal(form.state[2], '');
+    assert.equal(form.navigations.length, 1);
+    assert.equal(form.navigations[0].to, '/login');
+    assert.equal(form.navigations[0].options.state.registrationComplete, true);
+    assert.equal(JSON.stringify([...form.h.storage.values]), snapshot);
+    assert.equal(form.h.load('src/app/store.ts').store.getState().auth.user, null);
+    assert.equal(JSON.stringify(form.navigations).includes(registration.password), false);
+    form.h.assertSafeLogs([registration.password]);
+});
+
+test('registration shows all field errors below their inputs without calling the API', async () => {
+    let calls = 0;
+    const form = registrationForm({fetch: async () => {calls++; throw new Error('Unexpected request');}});
+    form.fill({username: 'a', email: 'toto@gmail..com', password: 'a'.repeat(11)});
+    await form.submit();
+    const rendered = form.render().props.children[1];
+    assert.equal(rendered.props.noValidate, true);
+    for (const name of ['username', 'email', 'password']) {
+        const children = rendered.props.children;
+        const index = children.findIndex(child => child?.type === 'input' && child.props.name === name);
+        const input = children[index];
+        assert.equal(input.props['aria-invalid'], true);
+        const error = children.slice(index + 1).find(child => child?.props?.id === `register-${name}-error`);
+        assert.equal(error.props.children, form.state[5][name]);
+        assert.equal(error.props.role, 'alert');
+        assert.equal(input.props['aria-describedby'].includes(error.props.id), true);
+    }
+    assert.equal(calls, 0);
+});
+
+test('registration form accepts twelve characters and clears previous field errors', async () => {
+    const form = registrationForm({fetch: async () => Response.json({id: 42, username: registration.username}, {status: 201})});
+    form.fill({...registration, password: 'a'.repeat(11)});
+    await form.submit();
+    assert.equal(typeof form.state[5].password, 'string');
+    form.fill({...registration, password: 'a'.repeat(12)});
+    await form.submit();
+    assert.equal(Object.keys(form.state[5]).length, 0);
+    assert.equal(form.navigations[0].to, '/login');
+});
+
+test('registration form shows a safe conflict error and re-enables submission', async () => {
+    const form = registrationForm({fetch: async () => new Response('private-db-detail', {status: 409})});
+    form.fill(registration);
+    await form.submit();
+    assert.equal(form.state[4], false);
+    assert.match(form.state[3], /déjà utilisé/);
+    assert.equal(form.state[3].includes('private-db-detail'), false);
+    assert.equal(form.navigations.length, 0);
+});
+
+test('login displays registration success from router state with no automatic authentication', () => {
+    const h = harness();
+    const markup = renderRoute(h, {pathname: '/login', state: {registrationComplete: true}});
+    assert.match(markup, /Compte créé/);
+    assert.match(markup, /href="\/register"/);
+    assert.equal(h.load('src/app/store.ts').store.getState().auth.user, null);
+});
+
+test('registration loads under native Node, not only through the test transpiler', async () => {
+    const {pathToFileURL} = require('node:url');
+    const module = await import(pathToFileURL(path.join(root, 'api/register.js')).href);
+    const response = await module.default.fetch(new Request('http://fixture.invalid/api/register'));
+    assert.equal(response.status, 405);
 });

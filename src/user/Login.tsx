@@ -1,7 +1,7 @@
 import React, {useState} from "react";
 import type {FormEvent} from "react";
 import {useDispatch, useSelector} from "react-redux";
-import {useNavigate} from "react-router-dom";
+import {Link, useLocation, useNavigate} from "react-router-dom";
 import type {RootState, AppDispatch} from "../app/store";
 import {setUser, resetAuth} from "../features/auth/authSlice";
 import {loginUser} from "./loginApi";
@@ -13,6 +13,7 @@ export function Login() {
     const [error, setError] = useState({} as CustomError);
     const dispatch = useDispatch<AppDispatch>();
     const navigate = useNavigate();
+    const location = useLocation();
     const {user, status} = useSelector((state: RootState) => state.auth);
 
     const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -45,6 +46,10 @@ export function Login() {
             <input name="password" type="password" placeholder="password"/><br/>
             <button type="submit">connexion</button>
         </form>
+            {location.state?.registrationComplete === true &&
+                <p role="status">Compte créé. Vous pouvez maintenant vous connecter.</p>
+            }
+            <Link to="/register">Créer un compte</Link>
             { status === "authenticated" && user &&
                 <span>Connecté : {user.username}</span>
             }
