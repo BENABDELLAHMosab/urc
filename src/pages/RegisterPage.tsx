@@ -6,6 +6,7 @@ import type {RegistrationFieldErrors} from "../../lib/registration.js";
 import {registerUser} from "../user/registerApi";
 import {AuthLayout} from '../components/AuthLayout';
 import {CustomError} from "../model/CustomError";
+import {PasswordInput} from '../components/PasswordInput';
 
 export function RegisterPage() {
     const [username, setUsername] = useState('');
@@ -55,7 +56,7 @@ export function RegisterPage() {
                     maxLength={255} value={email} onChange={event => setEmail(event.target.value)} disabled={pending} />
                 {fieldErrors.email && <p id="register-email-error" role="alert">{fieldErrors.email}</p>}
                 <label htmlFor="register-password">Mot de passe</label>
-                <input id="register-password" name="password" type="password" autoComplete="new-password" required
+                <PasswordInput id="register-password" name="password" autoComplete="new-password" required
                     minLength={12} maxLength={128} value={password}
                     aria-invalid={!!fieldErrors.password} aria-describedby="register-password-help register-password-error"
                     onChange={event => setPassword(event.target.value)} disabled={pending} />

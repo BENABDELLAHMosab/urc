@@ -7,6 +7,7 @@ import {setUser, resetAuth} from "../features/auth/authSlice";
 import {loginUser} from "./loginApi";
 import type {Session} from "../model/common";
 import {CustomError} from "../model/CustomError";
+import {PasswordInput} from '../components/PasswordInput';
 
 export function Login() {
 
@@ -49,7 +50,7 @@ export function Login() {
             <label htmlFor="login-username">Nom d’utilisateur</label>
             <input id="login-username" name="login" autoComplete="username" placeholder="Votre nom d’utilisateur" aria-invalid={!!error.message} aria-describedby={error.message ? "login-error" : undefined} />
             <label htmlFor="login-password">Mot de passe</label>
-            <input id="login-password" name="password" type="password" autoComplete="current-password" aria-invalid={!!error.message} placeholder="Votre mot de passe" aria-describedby={error.message ? "login-error" : undefined} />
+            <PasswordInput id="login-password" name="password" autoComplete="current-password" aria-invalid={!!error.message} placeholder="Votre mot de passe" aria-describedby={error.message ? "login-error" : undefined} />
             { error.message &&
                 <p id="login-error" role="alert">{error.message}</p>
             }

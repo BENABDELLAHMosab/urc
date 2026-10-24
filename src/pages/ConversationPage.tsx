@@ -31,7 +31,7 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
             dispatch(clearMessages());
         };
     }, [dispatch, recipient.user_id, user]);
-    const refresh = useMessagePolling(recipient.user_id);
+    useMessagePolling(recipient.user_id);
     useLayoutEffect(() => {
         if (list.current && nearBottom.current) list.current.scrollTop = list.current.scrollHeight;
     }, [messages.items]);
@@ -49,8 +49,7 @@ function PrivateConversation({recipient, user}: {recipient: PublicUser; user: Au
     const sending = current && messages.sendStatus === 'loading';
     return <section className="private-conversation" aria-label="Conversation privée">
         <ConversationHeader title={`Conversation avec ${recipient.username}`} subtitle="Discussion privée"
-            backTo="/messages" backLabel="Retour aux utilisateurs"
-            action={<button className="button-quiet" type="button" disabled={!current || messages.readStatus === 'loading'} onClick={refresh}>Actualiser</button>} />
+            backTo="/messages" backLabel="Retour aux utilisateurs" />
         {(!current || (!messages.hasLoaded && messages.readStatus === 'loading')) && <p role="status">Chargement des messages…</p>}
         {current && messages.readError && <p className={messages.hasLoaded ? 'polling-error' : undefined}
             role={messages.hasLoaded ? 'status' : 'alert'}>{messages.readError}</p>}

@@ -2,6 +2,17 @@ import type {AuthUser} from "./authSlice";
 import {clearStoredSession} from "../../user/loginApi";
 import {CustomError} from "../../model/CustomError";
 
+export async function logoutSession(): Promise<void> {
+    const token = sessionStorage.getItem('token');
+    if (!token) return;
+    const response = await fetch('/api/logout', {
+        method: 'POST', headers: {Authorization: `Bearer ${token}`}, cache: 'no-store',
+    });
+    if (!response.ok && response.status !== 401) {
+        throw new CustomError("Déconnexion impossible. Veuillez réessayer.");
+    }
+}
+
 export async function verifySession(signal: AbortSignal): Promise<AuthUser | null> {
     try {
         signal.throwIfAborted();

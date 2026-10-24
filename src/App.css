@@ -1,7 +1,7 @@
 /* Structure partagée par les espaces privés et publics. */
 .chat-shell { display: grid; grid-template-columns: 306px minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; background: var(--surface); }
 .sidebar { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--line); background: var(--background); }
-.sidebar-header { padding: 27px 22px 22px; }
+.sidebar-header { padding: 27px 22px 22px; flex-shrink: 0; }
 .brand { display: inline-block; color: var(--text); font-size: 1.15rem; font-weight: 600; text-decoration: none; letter-spacing: -.025em; }
 .account { display: flex; align-items: center; gap: 11px; margin-top: 27px; min-width: 0; }
 .account > div { min-width: 0; }
@@ -28,8 +28,9 @@
 .directory-notice { padding: 10px 22px 16px; font-size: .87rem; color: var(--muted); }
 .directory-notice[role="alert"] { color: var(--danger); }
 .directory-notice button { margin-top: 10px; }
-.sidebar-footer { padding: 14px 20px; border-top: 1px solid var(--line); flex-shrink: 0; }
-.notification-preferences { max-height: 42dvh; overflow-y: auto; font-size: .82rem; }
+.logout-button { margin-top: 12px; }
+.logout-error { margin-top: 8px; font-size: .82rem; }
+.notification-preferences { margin-top: 10px; max-height: 30dvh; overflow-y: auto; font-size: .82rem; }
 .notification-preferences summary { padding: 6px 0; min-height: 36px; cursor: pointer; color: var(--muted); }
 .notification-preferences[open] summary { color: var(--text); }
 .notification-controls { padding: 10px 0 2px; }
@@ -58,6 +59,9 @@
 .auth-form label { font-size: .88rem; font-weight: 500; margin-top: 11px; }
 .auth-form label:first-child { margin-top: 0; }
 .auth-form button { margin-top: 17px; padding: 11px 16px; }
+.password-field { position: relative; }
+.password-field input { padding-right: 48px; }
+.auth-form .password-toggle { position: absolute; top: 50%; right: 5px; transform: translateY(-50%); display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; margin: 0; padding: 8px; border: 0; background: transparent; color: var(--muted); }
 .auth-form [role="alert"], .auth-panel > [role="alert"] { font-size: .85rem; }
 .auth-form #register-password-help { font-size: .8rem; color: var(--muted); }
 .auth-panel > [role="status"], .auth-panel > [role="alert"] { margin-top: 18px; }

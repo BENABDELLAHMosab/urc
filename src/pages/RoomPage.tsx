@@ -26,7 +26,7 @@ function RoomConversation({room, user}: {room: Room; user: AuthUser}) {
         active.current = true; dispatch(openRoom(room.room_id));
         return () => {active.current = false; pendingSend.current?.abort(); dispatch(clearRoomMessages());};
     }, [dispatch, room.room_id, user]);
-    const refresh = useMessagePolling(room.room_id, 'room');
+    useMessagePolling(room.room_id, 'room');
     useLayoutEffect(() => {
         if (list.current && nearBottom.current) list.current.scrollTop = list.current.scrollHeight;
     }, [messages.items]);
@@ -41,8 +41,7 @@ function RoomConversation({room, user}: {room: Room; user: AuthUser}) {
     const sending = current && messages.sendStatus === 'loading';
     return <section className="private-conversation" aria-label="Messages du salon">
         <ConversationHeader title={`Salon : ${room.name}`} subtitle="Tous les utilisateurs connectés peuvent lire et écrire ici."
-            backTo="/rooms" backLabel="Retour aux salons"
-            action={<button className="button-quiet" type="button" disabled={!current || messages.readStatus === 'loading'} onClick={refresh}>Actualiser</button>} />
+            backTo="/rooms" backLabel="Retour aux salons" />
         {(!current || (!messages.hasLoaded && messages.readStatus === 'loading')) && <p role="status">Chargement des messages…</p>}
         {current && messages.readError && <p role={messages.hasLoaded ? 'status' : 'alert'} className="polling-error">{messages.readError}</p>}
         {current && messages.hasLoaded && messages.items.length === 0 && <p>Aucun message dans ce salon.</p>}
