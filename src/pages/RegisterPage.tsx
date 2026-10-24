@@ -1,6 +1,10 @@
 import React, {useState} from "react";
 import type {FormEvent} from "react";
 import {Link, useNavigate} from "react-router-dom";
+import {useDispatch} from 'react-redux';
+import type {AppDispatch} from '../app/store';
+import {resetAuth, setUser} from '../features/auth/authSlice';
+import {loginUser} from '../user/loginApi';
 import {validateRegistration} from "../../lib/registration.js";
 import type {RegistrationFieldErrors} from "../../lib/registration.js";
 import {registerUser} from "../user/registerApi";
@@ -14,12 +18,14 @@ export function RegisterPage() {
     const [password, setPassword] = useState('');
     const [error, setError] = useState('');
     const [pending, setPending] = useState(false);
+    const [accountCreated, setAccountCreated] = useState(false);
     const [fieldErrors, setFieldErrors] = useState<RegistrationFieldErrors>({});
     const navigate = useNavigate();
+    const dispatch = useDispatch<AppDispatch>();
 
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
-        if (pending) return;
+        if (pending || accountCreated) return;
         setError('');
         setFieldErrors({});
         const validation = validateRegistration({username, email, password});
@@ -30,9 +36,20 @@ export function RegisterPage() {
         }
         setPending(true);
         try {
-            await registerUser(validation.data);
+            const account = await registerUser(validation.data);
+            setAccountCreated(true);
             setPassword('');
-            navigate('/login', {replace: true, state: {registrationComplete: true}});
+            await loginUser({user_id: account.id, username: account.username, password: validation.data.password},
+                session => {
+                    if (session.id !== account.id || session.username !== account.username) {
+                        throw new CustomError('Réponse de connexion invalide.');
+                    }
+                    dispatch(setUser({id: session.id, username: session.username, externalId: session.externalId}));
+                    navigate('/messages', {replace: true});
+                }, () => {
+                    dispatch(resetAuth());
+                    setError('Votre compte a été créé, mais la connexion automatique a échoué. Utilisez le lien ci-dessous pour vous connecter normalement.');
+                });
         } catch (failure) {
             setError(failure instanceof CustomError ? failure.message
                 : "Inscription impossible. Veuillez réessayer.");
@@ -62,11 +79,11 @@ export function RegisterPage() {
                     onChange={event => setPassword(event.target.value)} disabled={pending} />
                 <p id="register-password-help">12 à 128 caractères pour le mot de passe.</p>
                 {fieldErrors.password && <p id="register-password-error" role="alert">{fieldErrors.password}</p>}
-                <button className="button-primary" type="submit" disabled={pending}>{pending ? 'Inscription en cours…' : "S'inscrire"}</button>
+                <button className="button-primary" type="submit" disabled={pending || accountCreated}>{pending ? 'Inscription et connexion en cours…' : accountCreated ? 'Compte créé' : "S'inscrire"}</button>
             </form>
-            {pending && <p role="status">Inscription en cours…</p>}
+            {pending && <p role="status">Inscription et connexion en cours…</p>}
             {error && <p role="alert">{error}</p>}
-            <Link className="auth-switch" to="/login">Retour à la connexion</Link>
+            <Link className="auth-switch" to="/login">{accountCreated ? 'Se connecter' : 'Retour à la connexion'}</Link>
         </AuthLayout>
     );
 }
